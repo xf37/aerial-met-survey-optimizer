@@ -88,9 +88,18 @@ This is a variant of the **Selective Travelling Salesman Problem** (STSP / Orien
 
 ### V2 — Orienteering with Free Scan Direction
 
-Extends V1 by making **θ_k ∈ Θ = {0°, 15°, 30°, …, 165°}** (12 discrete values) a per-supercell decision variable alongside visit selection and order.
+Extends V1 by making **θ_k** a per-supercell decision variable alongside visit selection and order.
 
-**Key consequence:** the transit cost between two supercells now depends on both their scan directions, so the 2D cost matrix becomes a 4D tensor:
+**All algorithms in V2 operate over a discretized θ grid — continuous optimization is not used anywhere.** The transit cost c(exit(i,θ_i), entry(j,θ_j)) is a nonlinear function of θ, so keeping θ continuous would require MINLP (mixed-integer nonlinear programming). Instead θ is discretized to a finite set, converting the problem back into a pure integer program that standard solvers and heuristics can handle. The grid granularity differs by algorithm:
+
+| Algorithm | θ grid | Step size |
+|---|---|---|
+| Greedy, ALNS | Θ = {0°, 15°, …, 165°} | 15° (T = 12 values) |
+| MILP (extended graph) | Θ_MILP = {0°, 30°, …, 150°} | 30° (T = 6 values) |
+
+MILP uses a coarser grid to keep the extended graph smaller (N×T virtual nodes). ALNS uses a finer grid, which is why ALNS can find better solutions than MILP here — they are optimizing over slightly different search spaces.
+
+**Key consequence:** the transit cost depends on both endpoints' scan directions, so the 2D cost matrix becomes a 4D tensor (precomputed for all (i, θ_i, j, θ_j) combinations):
 
 ```
 C^(4)[i, θ_i, j, θ_j]  =  min_{e ∈ exits(i,θ_i),  n ∈ entries(j,θ_j)}  ‖e − n‖
@@ -100,18 +109,24 @@ C^(4)[i, θ_i, j, θ_j]  =  min_{e ∈ exits(i,θ_i),  n ∈ entries(j,θ_j)}  �
 - θ = φ maximizes score, but exit/entry geometry may be poor → high transit cost
 - θ ≠ φ slightly reduces score, but better geometry → lower transit → budget saved → possibly visit one more cell
 
-**V2 MILP (extended graph):** create a virtual node (i, k) for every (supercell i, theta index k) pair. Add a "one-config-per-cell" constraint: each physical supercell may be visited in at most one theta configuration. The MILP is exact over the discretized θ grid.
+**V2 MILP (extended graph):** create a virtual node (i, k) for every (supercell i, theta index k) pair. Add a "one-config-per-cell" constraint: each physical supercell may be visited in at most one theta configuration. The MILP is exact over its T=6 grid.
 
 ### V3 — Full Observation Parameter Optimization
 
-Extends V2 by also making **pattern geometry parameters** decision variables:
+Extends V2 by also making **pattern geometry parameters** decision variables. As in V2, all parameters are discretized — no continuous optimization is performed by any algorithm.
 
-| Cell type | Additional V3 variables | Discrete levels |
-|---|---|---|
-| Circular | Leg half-length L | L = r + {15, 35, 55, 75} km (4 values) |
-| Elliptical | Leg count m, spacing s | m ∈ {2,3,4,5}, s ∈ {10,15,20} km (12 combinations) |
+| Parameter | Cell type | Discrete values | # levels |
+|---|---|---|---|
+| θ | Both | {0°, 15°, …, 165°} | 12 |
+| L | Circular | r + {15, 35, 55, 75} km | 4 |
+| m | Elliptical | {2, 3, 4, 5} | 4 |
+| s | Elliptical | {10, 15, 20} km | 3 |
 
-V3 enumerates all feasible **(θ, L)** or **(θ, m, s)** configurations per supercell. No MILP formulation is used at this scale — only ALNS with configuration-level local search.
+Per-cell configuration space (all valid (θ, param) combos enumerated by `enum_configs()`):
+- Circular: 12 × 4 = **48 configurations**
+- Elliptical: 12 × 4 × 3 = **144 configurations**
+
+Greedy and ALNS both call `enum_configs()` to iterate over all configurations when inserting or locally improving a node. No MILP is formulated for V3 (extended graph would have N × 144 virtual nodes plus subtour constraints — intractable at scale).
 
 **V3 trade-off:** sparser patterns (fewer legs, smaller L) sacrifice a small amount of score per cell but free up flight budget to visit an additional high-value cell, yielding a net positive gain.
 
