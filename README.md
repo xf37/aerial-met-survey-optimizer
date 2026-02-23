@@ -123,58 +123,105 @@ V3 enumerates all feasible **(θ, L)** or **(θ, m, s)** configurations per supe
 
 | Algorithm | Problem | Optimality | Complexity | Notes |
 |---|---|---|---|---|
-| Nearest Neighbor | TSP | Heuristic | O(N²) | ~71% above optimal |
+| Nearest Neighbor | TSP | Heuristic | O(N²) | ~71% above optimal on benchmark |
 | 2-opt | TSP | **Local optimum** | O(N²/iter) | Practical for N ≤ 30 |
 | Held-Karp DP | TSP | **Global optimum** | O(2^N · N²) | Exact, feasible N ≤ 20 |
 | MILP MTZ (CBC) | TSP, V1-OP, V2-OP | **Global optimum** | Exponential worst-case | Practical N ≤ ~20 |
 | Greedy ratio | V1/V2/V3-OP | Heuristic | O(N²) | No optimality guarantee |
 | **ALNS** | V1/V2/V3-OP | **Local optimum** (heuristic) | O(iter × N) | Near-optimal in practice |
 
-### Local vs Global Optimality — Analysis by Problem Version
+### Algorithm Descriptions
 
-#### TSP (notebook 02)
-- **Held-Karp DP** and **MILP**: provably find the **global optimum** for the given instance. Held-Karp is feasible for N ≤ 20; MILP (branch-and-bound) practical for N ≤ ~15.
-- **2-opt**: converges to a **local optimum** with respect to 2-edge swaps. In practice finds the optimal tour for the N=20 benchmark, but this is not guaranteed.
-- **Nearest Neighbor**: pure greedy, no optimality property.
+#### Nearest Neighbor (NN)
+Greedy tour construction for TSP. Starting from the base, always fly to the nearest unvisited supercell; return to base at the end. Each step is O(N), total O(N²). Fast and simple, but locally greedy decisions lead to globally poor routes — typically 20–70% above optimal. Used here as a baseline and to calibrate the budget B (B = 55% of NN full-tour cost).
 
-#### V1-OP (notebook 03)
-- **MILP (MTZ + CBC)**: finds the **global optimum** of the V1 integer program. Verified on benchmark: score 20.150, 81.8 s.
-- **ALNS**: a metaheuristic with **no optimality guarantee**. Destroy operators allow escape from local optima, but convergence to global optimum is not guaranteed. On the benchmark, ALNS matched the MILP optimum in 229 ms (360× faster).
-- **Greedy**: inserts by score/cost ratio, no backtracking. Pure heuristic, can miss globally better solutions.
+#### 2-opt Local Search
+Iterative improvement heuristic for TSP. At each pass, try all O(N²) pairs of edges; if reversing the segment between them shortens the total tour, accept the swap and restart. Repeat until no improving 2-swap exists. Converges to a **2-optimal** local solution: no single pair of edges can be swapped to improve the tour. In practice very effective — finds the optimal tour on this benchmark — but no global guarantee.
 
-#### V2-OP (notebook 04)
-- **V2 MILP**: globally optimal **over the coarser discrete θ grid** (T = 6 values). Not directly comparable to V2 ALNS which uses a finer grid (T = 12). On the benchmark, ALNS outperforms MILP precisely because it searches over twice as many θ values.
-- **V2 ALNS**: heuristic over the T = 12 grid. No global optimality guarantee, but outperforms MILP due to finer θ discretization and richer local search (theta sweep after every repair).
+#### Held-Karp Dynamic Programming
+Exact TSP algorithm based on bitmask DP over subsets of nodes.
 
-#### V3-OP (notebook 05)
-- **No exact algorithm is applied.** The joint V3 problem (select supercells + sequence + choose θ, L, m, s) is NP-hard and the search space per cell is ~48× larger than V2.
-- **V3 ALNS** is the sole method: local optimum / heuristic only. The configuration-level local search (`param_ls`) improves solution quality but gives no global guarantee.
-- Even the MILP results for V1/V2 are exact only within the **discretized** parameter space; the underlying continuous problem (θ ∈ [0°, 180°)) has no known exact method at scale.
+- **State:** `dp[S][v]` = minimum cost to start at base, visit exactly the nodes in set S, and end at node v
+- **Recurrence:** `dp[S][v] = min over u in S\{v} of  dp[S\{v}][u] + c[u][v]`
+- **Base case:** `dp[{v}][v] = c[0][v]`
+- **Answer:** `min over v of  dp[all nodes][v] + c[v][0]`
+- **Time:** O(2^N · N²), **Space:** O(2^N · N)
 
-### ALNS Design
+Provably finds the **global optimum**. Practical for N ≤ ~20 (at N=20: ~117 ms; at N=25: ~30 s; at N=30: ~hours).
 
-The same ALNS framework is reused across V1, V2, V3 with progressive extensions:
+#### MILP with MTZ Subtour Elimination
+Formulates the routing problem as a **Mixed-Integer Linear Program** solved by branch-and-bound (PuLP + CBC open-source solver).
 
-**Destroy operators** (select which nodes to remove):
-- `rand_1` — remove 1 random node from the current tour
-- `rand_2` — remove 2 random nodes
-- `worst` — remove the node with the lowest marginal value (score per unit of saved distance)
+The key challenge in routing MILPs is preventing **subtours** — disconnected cycles that don't include the base. The **Miller-Tucker-Zemlin (MTZ)** formulation eliminates subtours compactly using a position variable u_i ∈ [1,N] per node with the single-constraint family:
+```
+u_i − u_j + N · x_{ij} ≤ N − 1    ∀ i ≠ j ≥ 1
+```
+This forces a consistent ordering of visited nodes, making disconnected subtours infeasible. The MILP is solved to **certified global optimality** (zero optimality gap) via branch-and-bound. Worst-case exponential, but practical for N ≤ ~20 with a good solver.
 
-**Repair operators** (re-insert removed nodes):
-- `greedy_ratio` — at each step, insert the node with the highest score / insertion-cost ratio
-- `score_first` — insert the highest-score feasible node first
+**Why can V2 use MILP if θ is geometrically a continuous variable?**
+In this formulation, θ is **explicitly discretized** to a finite grid Θ = {0°, 15°, …, 165°} (T values) — this is a design choice, not a physical constraint. Each (supercell i, θ_k) pair is treated as a distinct virtual node in an extended graph. The V2 MILP then routes over these virtual nodes with standard binary arc variables and linear constraints — it is still a pure integer linear program.
 
-**V2 extension:**
-- `best_theta_for_insert` — when inserting a node, scan all T θ values and pick the one with best score/cost ratio
-- `theta_local_search` — after each repair, sweep all θ values for every visited node and accept any improving move
+If θ were kept continuous, the transit cost c(exit(i, θ_i), entry(j, θ_j)) would be a **nonlinear** (trigonometric) function of θ_i and θ_j, turning the problem into a Mixed-Integer Nonlinear Program (MINLP) — far harder to solve globally. Discretization trades a coarser θ resolution for the ability to use efficient MILP solvers. ALNS uses T=12 (15° steps); MILP uses T=6 (30° steps) to keep the extended graph smaller.
 
-**V3 extension:**
-- `best_cfg_for_insert` — when inserting a node, enumerate all (θ, L) or (θ, m, s) configurations
-- `param_ls` — after each repair, sweep all configurations for every visited node and accept improving moves
+#### Greedy Ratio (for Orienteering Problem)
+Constructive heuristic for the OP. Maintains a current partial tour. At each step:
+1. For every unvisited supercell k, find the cheapest insertion position in the current tour (O(|tour|) per node)
+2. Compute the **ratio** score_k / Δ_k, where Δ_k is the additional distance from inserting k at its best position
+3. Insert the k with the highest ratio, if doing so keeps total distance ≤ B
+4. Repeat until no insertion is budget-feasible
 
-**Operator weight update:** multiplicative (+20% on improvement, ×0.98 decay per iteration). Designed for future replacement with a contextual bandit / RL policy (Learning-Augmented ALNS).
+O(N²) total. Fast, no backtracking. Can be suboptimal because a greedy insertion at step t may block a higher-value combination at step t+1.
 
-**Acceptance criterion:** always keep the global best; the working solution follows a random walk (always accept the result of destroy+repair regardless of quality), which helps diversity.
+#### ALNS (Adaptive Large Neighborhood Search)
+Metaheuristic for the OP, adapted for V1/V2/V3. Iteratively destroys part of the current solution and repairs it, using a **portfolio of operators** whose selection probabilities adapt based on historical performance.
+
+**Core loop (800 iterations for V1, 600 for V2/V3):**
+```
+1. Destroy:   select operator D_i by weighted random draw; remove nodes from tour
+2. Repair:    select operator R_j by weighted random draw; reinsert removed nodes
+3. Local search (V2/V3): sweep all θ / (θ,L,m,s) configs for every visited node
+4. Update:    if new solution improves global best → weight[D_i] *= 1.20,  weight[R_j] *= 1.20
+              every iteration → all weights *= 0.98  (decay toward uniform)
+5. Accept:    always update working solution (random walk); keep global best separately
+```
+
+**Destroy operators:**
+- `rand_1` — remove 1 random node; explores broadly
+- `rand_2` — remove 2 random nodes; larger perturbation
+- `worst` — remove the node with the lowest score / marginal-savings ratio; targeted improvement
+
+**Repair operators:**
+- `greedy_ratio` — reinsert by score / insertion-cost ratio (same logic as greedy above)
+- `score_first` — greedily insert the highest-score node that fits within budget
+
+**V2 additions:**
+- `best_theta_for_insert` — at insertion time, scan all T θ values; pick (position, θ) jointly maximising score/cost
+- `theta_local_search` — post-repair: for each node in tour, try all T θ values; accept any score-improving θ swap that keeps distance ≤ B
+
+**V3 additions:**
+- `best_cfg_for_insert` — enumerate all (θ, L) or (θ, m, s) configs at insertion time
+- `param_ls` — post-repair: for each node, try all configs; accept improving ones
+
+ALNS can escape local optima via the destroy step (unlike pure local search), but **convergence to the global optimum is not guaranteed**. The random-walk acceptance criterion maintains solution diversity; the adaptive weights steer the search toward operators that have been productive.
+
+### Local vs Global Optimality — Summary by Problem Version
+
+| Problem | Algorithm | Optimality guarantee |
+|---|---|---|
+| TSP | Nearest Neighbor | None (heuristic) |
+| TSP | 2-opt | **2-optimal local optimum** |
+| TSP | Held-Karp DP | **Global optimum** ✓ |
+| TSP / V1-OP | MILP (MTZ + CBC) | **Global optimum** ✓ |
+| V1-OP | Greedy ratio | None (heuristic) |
+| V1-OP | ALNS | Local optimum (no global guarantee) |
+| V2-OP | MILP (extended graph) | **Global optimum over discretized θ grid** ✓ |
+| V2-OP | ALNS | Local optimum (no global guarantee) |
+| V3-OP | ALNS only | Local optimum (no global guarantee) |
+
+**Key caveats:**
+- All MILP results are optimal only within the **discretized** parameter space (finite θ grid, fixed L/m/s). The underlying continuous problem has no known polynomial exact method.
+- V2 MILP uses T=6 while V2 ALNS uses T=12 — they solve slightly different discretized problems, which is why ALNS can outperform MILP here.
+- V3 has no exact method: the joint problem (selection + sequence + all parameters) is NP-hard with ~144 configs/cell.
 
 ---
 
