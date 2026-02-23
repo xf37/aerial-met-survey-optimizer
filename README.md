@@ -205,17 +205,18 @@ ALNS matches the MILP global optimum at **360× lower runtime**. ALNS optimality
 
 ### V1 → V2 → V3 progression (notebook 05, same scenario)
 
+> **Run `05_v3_orienteering.ipynb` to populate this table with actual results.**
+
 | Version | Decision variables | Optimality | Supercells visited | Score | % of max | Distance | Time |
 |---|---|---|---|---|---|---|---|
-| V1 ALNS | visit + order | Local opt. (heuristic) | 13 | 10.650 | 55.0% | 1,640 km | 0.31 s |
-| V2 ALNS | + scan direction θ | Local opt. (heuristic) | 14 | 11.256 | 58.1% | 1,518 km | 0.35 s |
-| V3 ALNS | + leg params L/m/s | Local opt. (heuristic) | 14 | **11.473** | **59.2%** | 1,520 km | 2.35 s |
+| V1 ALNS | visit + order | Local opt. (heuristic) | — | — | — | — | — |
+| V2 ALNS | + scan direction θ | Local opt. (heuristic) | — | — | — | — | — |
+| V3 ALNS | + leg params L/m/s | Local opt. (heuristic) | — | — | — | — | — |
 
-Key observations:
-- **V2 over V1**: +0.606 score (+5.7%), visits 1 extra supercell. Gained by adjusting θ to improve routing geometry.
-- **V3 over V2**: +0.217 score (+1.9%), same cell count. Gained by freeing L/m/s to reduce internal flight distances.
-- **V3 over V1**: +0.823 score total (+7.7% improvement).
-- V2 and V3 are **heuristics only** — they may not be globally optimal, but demonstrate clear measurable gains over the more constrained formulations.
+Expected trends:
+- V2 over V1: score gain and/or more supercells visited, by adjusting θ to improve routing geometry
+- V3 over V2: additional gain by freeing L/m/s to reduce internal flight distances
+- All three versions are **heuristics** — results represent high-quality local optima, not provably global optima
 
 ### Budget sensitivity
 
