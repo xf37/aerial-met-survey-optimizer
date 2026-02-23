@@ -203,19 +203,20 @@ All results use a scenario of **N = 20 supercells** (8 circular + 12 elliptical)
 
 ALNS matches the MILP global optimum at **360× lower runtime**. ALNS optimality gap = 0.00%.
 
-### V1 → V2 → V3 progression (notebook 05, same scenario)
+### V1 → V2 → V3 progression (notebook 05, N = 20, budget = 8,262 km)
 
-> **Run `05_v3_orienteering.ipynb` to populate this table with actual results.**
+Max possible score (all 20 cells): **32.260**
 
 | Version | Decision variables | Optimality | Supercells visited | Score | % of max | Distance | Time |
 |---|---|---|---|---|---|---|---|
-| V1 ALNS | visit + order | Local opt. (heuristic) | — | — | — | — | — |
-| V2 ALNS | + scan direction θ | Local opt. (heuristic) | — | — | — | — | — |
-| V3 ALNS | + leg params L/m/s | Local opt. (heuristic) | — | — | — | — | — |
+| V1 ALNS | visit + order | Local opt. (heuristic) | 11 | 18.579 | 57.6% | 7,709 km | 28 s |
+| V2 ALNS | + scan direction θ | Local opt. (heuristic) | 13 | 20.007 | 62.0% | 8,227 km | 500 s |
+| V3 ALNS | + leg params L/m/s | Local opt. (heuristic) | **17** | **26.882** | **83.3%** | 8,257 km | 2,033 s |
 
-Expected trends:
-- V2 over V1: score gain and/or more supercells visited, by adjusting θ to improve routing geometry
-- V3 over V2: additional gain by freeing L/m/s to reduce internal flight distances
+Key observations:
+- **V2 over V1**: +1.428 score (+7.7%), 2 extra supercells — θ freedom improves routing geometry
+- **V3 over V2**: +6.875 score (+34.4%), 4 extra supercells — freeing L/m/s dramatically reduces internal flight distances, unlocking visits to previously unreachable cells
+- **V3 over V1**: +8.303 score total (+44.7%), 6 extra supercells — V3 visits 17/20 cells vs V1's 11/20 within the same budget
 - All three versions are **heuristics** — results represent high-quality local optima, not provably global optima
 
 ### Budget sensitivity
