@@ -8,7 +8,7 @@ A progressive optimization framework for planning airborne meteorological observ
 
 Research aircraft must fly specific sampling patterns through each supercell to collect meaningful data. The route planning problem is a variant of the **Orienteering Problem** (OP): select a subset of supercells to visit and determine the flight order, subject to a total distance budget, to maximize scientific value.
 
-This project models two types of supercells with physically-motivated observation patterns, then solves the routing problem across three levels of increasing complexity (V1 → V2 → V3), comparing exact algorithms (MILP, dynamic programming) against the heuristic **Adaptive Large Neighborhood Search (ALNS)**.
+This project models two types of supercells with physically-motivated observation patterns, then solves the routing problem across two levels of increasing complexity (V2 → V3), comparing exact algorithms (MILP, dynamic programming) against the heuristic **Adaptive Large Neighborhood Search (ALNS)**.
 
 ---
 
@@ -63,28 +63,6 @@ score_i(θ, m, s) = w_i · [β · WidthCoverage(θ, m, s)  +  (1−β) · Direct
 | c_{ij} | transit distance from exit point(s) of i to entry point(s) of j |
 | d^int_i | internal flight distance of the observation pattern at supercell i |
 | c'_{ij} | effective arc cost = c_{ij} + d^int_j (folds internal flight of destination into arc) |
-
-### V1 — Standard Orienteering Problem (fixed θ, L, m, s)
-
-All observation parameters are fixed. Decision variables are visit selection and sequencing only.
-
-**MILP (MTZ formulation):**
-
-```
-Maximize    Σ_{i=1..N}  w_i · y_i
-
-Subject to:
-  Σ_j x_{0j} = 1                              (depart base exactly once)
-  Σ_i x_{i0} = 1                              (return to base exactly once)
-  Σ_{j≠i} x_{ij} = y_i   ∀i = 1..N          (flow out = visit indicator)
-  Σ_{j≠i} x_{ji} = y_i   ∀i = 1..N          (flow in  = visit indicator)
-  Σ_{i,j} c'_{ij} · x_{ij} ≤ B              (budget constraint)
-  u_i − u_j + N·x_{ij} ≤ N−1   ∀i≠j≥1      (MTZ subtour elimination)
-  u_i ≥ 1                        ∀i≥1
-  x_{ij} ∈ {0,1},  y_i ∈ {0,1}
-```
-
-This is a variant of the **Selective Travelling Salesman Problem** (STSP / Orienteering Problem). It is **NP-hard** in general, but solvable to optimality by MILP for small N (≤ ~20 with CBC solver).
 
 ### V2 — Orienteering with Free Scan Direction
 
@@ -141,9 +119,9 @@ Greedy and ALNS both call `enum_configs()` to iterate over all configurations wh
 | Nearest Neighbor | TSP | Heuristic | O(N²) | ~71% above optimal on benchmark |
 | 2-opt | TSP | **Local optimum** | O(N²/iter) | Practical for N ≤ 30 |
 | Held-Karp DP | TSP | **Global optimum** | O(2^N · N²) | Exact, feasible N ≤ 20 |
-| MILP MTZ (CBC) | TSP, V1-OP, V2-OP | **Global optimum** | Exponential worst-case | Practical N ≤ ~20 |
-| Greedy ratio | V1/V2/V3-OP | Heuristic | O(N²) | No optimality guarantee |
-| **ALNS** | V1/V2/V3-OP | **Local optimum** (heuristic) | O(iter × N) | Near-optimal in practice |
+| MILP MTZ (CBC) | TSP, V2-OP | **Global optimum** | Exponential worst-case | Practical N ≤ ~20 |
+| Greedy ratio | V2/V3-OP | Heuristic | O(N²) | No optimality guarantee |
+| **ALNS** | V2/V3-OP | **Local optimum** (heuristic) | O(iter × N) | Near-optimal in practice |
 
 ### Algorithm Descriptions
 
@@ -190,7 +168,7 @@ O(N²) total. Fast, no backtracking. Can be suboptimal because a greedy insertio
 #### ALNS (Adaptive Large Neighborhood Search)
 Metaheuristic for the OP, adapted for V1/V2/V3. Iteratively destroys part of the current solution and repairs it, using a **portfolio of operators** whose selection probabilities adapt based on historical performance.
 
-**Core loop (800 iterations for V1, 600 for V2/V3):**
+**Core loop (600 iterations for V2/V3):**
 ```
 1. Destroy:   select operator D_i by weighted random draw; remove nodes from tour
 2. Repair:    select operator R_j by weighted random draw; reinsert removed nodes
@@ -226,15 +204,14 @@ ALNS can escape local optima via the destroy step (unlike pure local search), bu
 | TSP | Nearest Neighbor | None (heuristic) |
 | TSP | 2-opt | **2-optimal local optimum** |
 | TSP | Held-Karp DP | **Global optimum** ✓ |
-| TSP / V1-OP | MILP (MTZ + CBC) | **Global optimum** ✓ |
-| V1-OP | Greedy ratio | None (heuristic) |
-| V1-OP | ALNS | Local optimum (no global guarantee) |
+| TSP | MILP (MTZ + CBC) | **Global optimum** ✓ |
+| V2-OP | Greedy ratio | None (heuristic) |
 | V2-OP | MILP (extended graph) | **Global optimum over discretized θ grid** ✓ |
 | V2-OP | ALNS | Local optimum (no global guarantee) |
 | V3-OP | ALNS only | Local optimum (no global guarantee) |
 
 **Key caveats:**
-- All MILP results are optimal only within the **discretized** parameter space (finite θ grid, fixed L/m/s). The underlying continuous problem has no known polynomial exact method.
+- All MILP results are optimal only within the **discretized** parameter space (finite θ grid). The underlying continuous problem has no known polynomial exact method.
 - V2 MILP uses T=6 while V2 ALNS uses T=12 — they solve slightly different discretized problems, which is why ALNS can outperform MILP here.
 - V3 has no exact method: the joint problem (selection + sequence + all parameters) is NP-hard with ~144 configs/cell.
 
@@ -242,51 +219,26 @@ ALNS can escape local optima via the destroy step (unlike pure local search), bu
 
 ## Results
 
-All results use a scenario of **N = 20 supercells** (8 circular + 12 elliptical), budget B = 55% of the nearest-neighbor full-tour cost. Supercell body positions are generated by rejection sampling to guarantee no body overlap (verified min body separation: 12.1 km).
+All results use a scenario of **N = 6 supercells** (3 circular + 3 elliptical), budget B = 55% of the nearest-neighbor full-tour cost. Supercell placement uses rejection sampling with strict no-overlap guarantee: center separation > extent_i + extent_j + 15 km, where extent = radius (circular) or semi-major axis a (elliptical).
 
 ### TSP baseline (notebook 02, visit all N supercells)
 
-| Algorithm | Optimality | Transit Distance | Time |
-|---|---|---|---|
-| Nearest Neighbor | Heuristic | 2,704 km | < 1 ms |
-| 2-opt | Local optimum | 1,582 km | 0.27 ms |
-| Held-Karp DP | **Global optimum** | **1,582 km** | 117 ms |
-| MILP (MTZ + CBC) | **Global optimum** | **1,582 km** | 0.64 s |
+Results are re-generated upon running `02_tsp_all_visit.ipynb` with the current N=6 scenario.
 
-2-opt and both exact methods converge to the same tour (1,582 km) on this instance.
+| Algorithm | Optimality | Notes |
+|---|---|---|
+| Nearest Neighbor | Heuristic | Fast baseline |
+| 2-opt | Local optimum | Typically closes most of NN gap |
+| Held-Karp DP | **Global optimum** | Exact, very fast for N=6 |
+| MILP (MTZ + CBC) | **Global optimum** | Exact, certified zero gap |
 
-### V1-OP algorithm comparison (notebook 03, fixed parameters, budget 8,190 km)
+### V2-OP (notebook 03)
 
-| Algorithm | Optimality | Supercells visited | Score | Distance | Time |
-|---|---|---|---|---|---|
-| Greedy | Heuristic | 12 | 22.500 | 7,856 km | 1.4 ms |
-| ALNS (800 iter) | Local optimum | 12 | 22.570 | 8,095 km | 225 ms |
-| MILP (CBC) | **Global optimum** | **13** | **22.700** | 8,179 km | 52.9 s |
+V2 optimizes scan direction θ alongside visit selection and order. Results are re-generated upon running `03_v2_orienteering.ipynb`.
 
-ALNS finds a near-optimal solution at **235× lower runtime**. ALNS optimality gap = (22.700 − 22.570) / 22.700 = **0.57%**.
+### V3-OP (notebook 04)
 
-### V1 → V2 → V3 progression (notebook 05, N = 20, budget = 8,084 km)
-
-Max possible score (all 20 cells): **32.670**
-
-| Version | Decision variables | Optimality | Supercells visited | Score | % of max | Distance | Time |
-|---|---|---|---|---|---|---|---|
-| V1 ALNS | visit + order | Local opt. (heuristic) | 12 | 18.616 | 57.0% | 7,862 km | 23 s |
-| V2 ALNS | + scan direction θ | Local opt. (heuristic) | 14 | 19.340 | 59.2% | 8,080 km | 415 s |
-| V3 ALNS | + leg params L/m/s | Local opt. (heuristic) | **16** | **26.495** | **81.1%** | 8,084 km | 1,949 s |
-
-Key observations:
-- **V2 over V1**: +0.724 score (+3.9%), 2 extra supercells — θ freedom improves routing geometry
-- **V3 over V2**: +7.155 score (+37.0%), 2 extra supercells — freeing L/m/s dramatically reduces internal flight distances, unlocking visits to previously unreachable cells
-- **V3 over V1**: +7.879 score total (+42.3%), 4 extra supercells — V3 visits 16/20 cells vs V1's 12/20 within the same budget
-- All three versions are **heuristics** — results represent high-quality local optima, not provably global optima
-
-### Budget sensitivity
-
-Across all tested budget levels (25%–100% of full-tour cost):
-- V2 consistently outperforms V1 (largest gap at tight budgets where routing geometry matters most)
-- V3 adds further improvement on top of V2 at all budget levels
-- At very high budgets (≥ 85%), all versions converge as nearly all supercells can be visited
+V3 additionally optimizes pattern geometry parameters (L for circular, m/s for elliptical). Results are re-generated upon running `04_v3_orienteering.ipynb`.
 
 ---
 
@@ -294,25 +246,23 @@ Across all tested budget levels (25%–100% of full-tour cost):
 
 ```
 aerial-met-survey-optimizer/
-├── 00_simulation_data.ipynb              # Scenario generation
+├── 00_simulation_data.ipynb              # Scenario generation (N=6, strict no-overlap)
 ├── 01_supercell_concepts_and_visualization.ipynb  # Concepts, geometry, score functions
 ├── 02_tsp_all_visit.ipynb                # TSP baseline: visit all supercells
-├── 03_orienteering_op.ipynb              # V1-OP: fixed parameters, select subset
-├── 04_v2_orienteering.ipynb              # V2-OP: optimize scan direction θ
-├── 05_v3_orienteering.ipynb              # V3-OP: optimize all pattern parameters
+├── 03_v2_orienteering.ipynb              # V2-OP: optimize scan direction θ
+├── 04_v3_orienteering.ipynb              # V3-OP: optimize all pattern parameters
 ├── data/
-│   └── scenario_N12_seed42.pkl           # Serialized scenario
-└── figures/                              # Output visualizations (~18 PNGs)
+│   └── scenario_N6_seed42.pkl            # Serialized scenario
+└── figures/                              # Output visualizations
 ```
 
 | Notebook | Purpose |
 |---|---|
-| `00` | Generates a reproducible synthetic scenario: N supercells in an 800×600 km region |
-| `01` | Visualizes supercell patterns, derives score functions, introduces the three problem versions |
+| `00` | Generates a reproducible synthetic scenario: 3 circular + 3 elliptical supercells, no overlap |
+| `01` | Visualizes supercell patterns, derives score functions, demonstrates V2 concept |
 | `02` | Solves the TSP (visit-all) subproblem: Nearest Neighbor, 2-opt, Held-Karp DP, MILP |
-| `03` | Solves **V1-OP** (fixed parameters): Greedy, ALNS, exact MILP + budget sensitivity |
-| `04` | Solves **V2-OP** (free θ): 4D transit tensor, V2 ALNS with θ local search, V2 MILP |
-| `05` | Solves **V3-OP** (free θ + L/m/s): ALNS with full config enumeration, V1/V2/V3 comparison |
+| `03` | Solves **V2-OP** (free θ): 4D transit tensor, V2 ALNS with θ local search, V2 MILP |
+| `04` | Solves **V3-OP** (free θ + L/m/s): ALNS with full config enumeration |
 
 ---
 
@@ -334,17 +284,17 @@ Run notebooks in order:
 jupyter notebook 00_simulation_data.ipynb
 jupyter notebook 01_supercell_concepts_and_visualization.ipynb
 jupyter notebook 02_tsp_all_visit.ipynb
-jupyter notebook 03_orienteering_op.ipynb
-jupyter notebook 04_v2_orienteering.ipynb
-jupyter notebook 05_v3_orienteering.ipynb
+jupyter notebook 03_v2_orienteering.ipynb
+jupyter notebook 04_v3_orienteering.ipynb
 ```
 
 To generate a different scenario, modify parameters in `00_simulation_data.ipynb`:
 
 ```python
-N = 20              # number of supercells
-frac_circular = 0.4 # fraction that are circular
-seed = 42           # random seed for reproducibility
+N = 6               # total supercells (FRAC_CIRC=0.5 → 3 circular + 3 elliptical)
+FRAC_CIRC = 0.5     # fraction that are circular
+SEED = 42           # random seed for reproducibility
+OVERLAP_BUFFER = 15.0  # minimum separation buffer (km)
 ```
 
 ---
