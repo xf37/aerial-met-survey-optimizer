@@ -168,6 +168,9 @@ aerial-met-survey-optimizer/
 ├── 01_survey_patterns.ipynb        # Survey pattern concepts + score function analysis
 ├── 02_tsp_all_visit.ipynb          # TSP baseline: NN / 2-opt / Held-Karp DP / MILP
 ├── 03_orienteering.ipynb           # OP: precompute → exhaustive → MILP → ALNS
+├── unit_test_circular.ipynb        # Unit tests: circular supercell (3 scenarios)
+├── unit_test_elliptical.ipynb      # Unit tests: elliptical supercell (2 scenarios)
+├── unit_test_combined.ipynb        # Unit test: 1 circular + 1 elliptical, global optimality proof
 ├── data/
 │   └── scenario_N6_seed42.pkl      # Serialized 6-cell scenario
 └── figures/
@@ -177,8 +180,16 @@ aerial-met-survey-optimizer/
     ├── score_analysis.png           # Score vs n-legs and score vs survey-dist
     ├── tsp_comparison.png           # TSP optimal route with survey patterns
     ├── orienteering_route.png       # Full 6-cell route visualisation (all cells)
-    └── orienteering_comparison.png  # ALNS convergence + operator stats + score distribution
+    ├── orienteering_comparison.png  # ALNS convergence + operator stats + score distribution
+    ├── unit_test_s1.png             # Circular unit test: no obstacle
+    ├── unit_test_s2.png             # Circular unit test: obstacle between BASE and cell
+    ├── unit_test_s3.png             # Circular unit test: obstacle + sensitivity points
+    ├── unit_test_elliptical_s1.png  # Elliptical unit test: no obstacle
+    ├── unit_test_elliptical_s2.png  # Elliptical unit test: obstacle between BASE and cell
+    └── unit_test_combined.png       # Combined unit test: circular + elliptical
 ```
+
+### Main notebooks
 
 | Notebook | Purpose | Run time |
 |----------|---------|----------|
@@ -186,6 +197,18 @@ aerial-met-survey-optimizer/
 | `01` | Visualise survey patterns; explain score functions | < 30 s |
 | `02` | TSP on all 6 cells; compare 4 algorithms | < 10 s |
 | `03` | Full orienteering problem; exhaustive ground truth + MILP + ALNS | ~5 min |
+
+### Unit test notebooks
+
+Each unit test uses a minimal 1- or 2-cell scenario where the global optimum can be
+verified by exhaustive enumeration, confirming correctness of the route geometry and
+score computation before scaling up to the full 6-cell benchmark.
+
+| Notebook | Scenarios | What is tested |
+|----------|-----------|----------------|
+| `unit_test_circular` | S1: no obstacle<br>S2: obstacle between BASE and cell<br>S3: obstacle + sensitivity points | Cross survey waypoints, obstacle avoidance, sensitivity point routing |
+| `unit_test_elliptical` | S1: no obstacle<br>S2: large obstacle between BASE and ellipse | Boustrophedon scan, coverage score, leg ordering |
+| `unit_test_combined` | 1 circular + 1 elliptical cell | Joint routing over mixed cell types; MILP global optimality proof |
 
 ---
 
@@ -202,7 +225,7 @@ solver installation required).
 
 ## Usage
 
-Run notebooks in order:
+Run main notebooks in order:
 
 ```bash
 jupyter notebook 00_simulation_data.ipynb       # generates scenario pickle
@@ -211,7 +234,15 @@ jupyter notebook 02_tsp_all_visit.ipynb          # TSP baseline
 jupyter notebook 03_orienteering.ipynb           # full OP solution
 ```
 
-All notebooks load the scenario from `data/scenario_N6_seed42.pkl` (written by `00`).
+Unit test notebooks are self-contained (no pickle dependency) and can be run independently:
+
+```bash
+jupyter notebook unit_test_circular.ipynb        # 3 single-cell circular scenarios
+jupyter notebook unit_test_elliptical.ipynb      # 2 single-cell elliptical scenarios
+jupyter notebook unit_test_combined.ipynb        # 1 circular + 1 elliptical, optimality proof
+```
+
+All main notebooks load the scenario from `data/scenario_N6_seed42.pkl` (written by `00`).
 The scenario is hardcoded (not randomly generated) for full reproducibility.
 
 ---
