@@ -1,244 +1,162 @@
 # Aerial Met Survey Optimizer
 
-A progressive optimization framework for planning airborne meteorological observation routes. Given a set of meteorological targets (e.g., supercells, jet deformation zones, tropopause polar vortices) scattered across a flight region, the system finds the optimal flight path that maximizes scientific observation score within a flight distance budget.
+A route-planning framework for airborne meteorological observation missions. Given a
+set of supercell targets scattered across a flight region, the system finds the
+optimal flight path that maximises scientific observation score within a flight
+distance budget.
 
 ---
 
 ## Overview
 
-Research aircraft must fly specific sampling patterns through each supercell to collect meaningful data. The route planning problem is a variant of the **Orienteering Problem** (OP): select a subset of supercells to visit and determine the flight order, subject to a total distance budget, to maximize scientific value.
+Research aircraft must fly specific sampling patterns through each supercell.
+The route planning problem is a variant of the **Orienteering Problem (OP)**:
+select a subset of supercells and visit them in the best order, subject to a
+total distance budget, to maximise scientific value.
 
-This project models two types of supercells with physically-motivated observation patterns, then solves the routing problem across two levels of increasing complexity (V2 → V3), comparing exact algorithms (MILP, dynamic programming) against the heuristic **Adaptive Large Neighborhood Search (ALNS)**.
+This project models two types of supercell with physically-motivated observation
+patterns, solves the routing problem exactly (exhaustive enumeration, MILP) and
+heuristically (ALNS), and provides verified ground-truth comparisons.
 
 ---
 
 ## Supercell Models
 
-Two types of supercell are modeled, each with a distinct observation pattern:
-
 ### Circular Supercell (Tropopause Polar Vortex)
-- Exhibits radial symmetry
-- Observed by flying **two perpendicular crossing legs** through the center
-- Score is **invariant to scan direction** θ due to symmetry
-- Tunable parameter: leg half-length L
-- Score: `score_i = w_i` (weight only, independent of θ and L)
+
+- Observed by flying **two perpendicular crossing legs** through the cell centre
+- Score is **fixed** = `w_k` (weight only; independent of scan direction θ or leg length L)
+- Tunable: leg half-length L, scan direction θ
+- May include **sensitivity points** visited after the cross survey
+- Survey waypoints: `entry_tip → centre → far_tip → arm2_tip → centre → arm2_far_tip`
 
 ### Elliptical Supercell (Jet Deformation Zone)
-- Elongated along a principal axis at orientation φ
-- Observed by flying **m parallel legs** in a boustrophedon (lawnmower) pattern
-- Score depends strongly on scan direction θ: peaks when θ = φ (legs run along the major axis)
-- Tunable parameters: scan direction θ, number of legs m, leg spacing s
 
-Score function for elliptical supercells:
+- Observed by flying **n parallel legs** in a boustrophedon (lawnmower) pattern
+- Score depends on spatial coverage:
 
 ```
-score_i(θ, m, s) = w_i · [β · WidthCoverage(θ, m, s)  +  (1−β) · DirectionAlignment(θ)]
-
-  WidthCoverage(θ, m, s)  = min((m−1)·s,  W_⊥(θ)) / W_⊥(θ)
-                            (fraction of cross-axis width covered by the legs)
-
-  DirectionAlignment(θ)   = length of center leg / (2a)
-                            (ratio of center-leg length to major-axis diameter)
-
-  W_⊥(θ)  = full ellipse width measured perpendicular to scan direction θ
+f_k(n, s) = w_k × [CovArea(n, s) + 0.5 × OvlpArea(n, s)] / (π · a · b)
 ```
 
-**Key geometric insight:** once all observation parameters (θ, L, m, s) are fixed, all waypoints and entry/exit positions are fully determined — the distance matrix is precomputable.
+where `CovArea` is the ellipse area covered by at least one leg (strip width = SW = 12 km),
+`OvlpArea` is the area covered by two or more legs, and `π a b` is the full ellipse area.
+
+- Tunable: number of legs n, leg spacing s, scan direction θ
+
+### Key Geometric Insight
+
+Once all observation parameters (θ, L, n, s) are fixed, all waypoints and entry/exit
+positions are fully determined and precomputable. Survey starts **and ends at the cell
+centre**, decoupling internal flight geometry from inter-cell routing.
 
 ---
 
 ## Problem Formulation
 
-### Notation
+### Orienteering Problem
+
+$$\max_{S,\,\sigma} \sum_{k \in S} f_k \qquad
+  \text{s.t.}\quad
+  \sum_{k \in S} d_k^{\text{survey}} + \sum_{\text{transit}} T_{ij} \leq B$$
 
 | Symbol | Meaning |
-|---|---|
-| N | number of supercells |
-| 0 | base depot (airport) |
-| w_i | scientific weight of supercell i |
+|--------|---------|
+| S | selected subset of supercells to visit |
+| σ | visit order |
+| f_k | score of supercell k (fixed for circular; coverage-dependent for elliptical) |
+| d_k^survey | internal survey distance of cell k (start/end at cell centre) |
+| T_{ij} | obstacle-avoiding transit distance between cell centres i and j |
 | B | total flight distance budget |
-| x_{ij} ∈ {0,1} | arc variable: 1 if flight goes directly from i to j |
-| y_i ∈ {0,1} | visit indicator: 1 if supercell i is visited |
-| u_i ∈ [1,N] | MTZ position variable for subtour elimination |
-| c_{ij} | transit distance from exit point(s) of i to entry point(s) of j |
-| d^int_i | internal flight distance of the observation pattern at supercell i |
-| c'_{ij} | effective arc cost = c_{ij} + d^int_j (folds internal flight of destination into arc) |
 
-### V2 — Orienteering with Free Scan Direction
+The budget B is calibrated as the midpoint between the minimum 4-cell and 5-cell tour
+costs, forcing a non-trivial selection trade-off among all 6 cells.
 
-Extends V1 by making **θ_k** a per-supercell decision variable alongside visit selection and order.
+### MILP Formulation (MTZ subtour elimination)
 
-**All algorithms in V2 operate over a discretized θ grid — continuous optimization is not used anywhere.** The transit cost c(exit(i,θ_i), entry(j,θ_j)) is a nonlinear function of θ, so keeping θ continuous would require MINLP (mixed-integer nonlinear programming). Instead θ is discretized to a finite set, converting the problem back into a pure integer program that standard solvers and heuristics can handle. The grid granularity differs by algorithm:
-
-| Algorithm | θ grid | Step size |
-|---|---|---|
-| Greedy, ALNS | Θ = {0°, 15°, …, 165°} | 15° (T = 12 values) |
-| MILP (extended graph) | Θ_MILP = {0°, 30°, …, 150°} | 30° (T = 6 values) |
-
-MILP uses a coarser grid to keep the extended graph smaller (N×T virtual nodes). ALNS uses a finer grid, which is why ALNS can find better solutions than MILP here — they are optimizing over slightly different search spaces.
-
-**Key consequence:** the transit cost depends on both endpoints' scan directions, so the 2D cost matrix becomes a 4D tensor (precomputed for all (i, θ_i, j, θ_j) combinations):
+Variables: binary arc indicators x_{ij} ∈ {0,1}, binary visit indicators y_k ∈ {0,1},
+continuous MTZ position variables u_k ∈ [1, N].
 
 ```
-C^(4)[i, θ_i, j, θ_j]  =  min_{e ∈ exits(i,θ_i),  n ∈ entries(j,θ_j)}  ‖e − n‖
+max  Σ_k  f_k · y_k
+
+s.t.  Σ_j x_{0j} = 1                        (depart BASE once)
+      Σ_i x_{i0} = 1                        (return BASE once)
+      Σ_j x_{kj} = y_k  ∀k                  (flow out = visit)
+      Σ_i x_{ik} = y_k  ∀k                  (flow in  = visit)
+      Σ_{ij} T_{ij}·x_{ij} + Σ_k d_k·y_k ≤ B   (budget)
+      u_i − u_j + N·x_{ij} ≤ N−1  ∀i≠j≥1   (MTZ subtour elimination)
+
+      x_{ij}, y_k ∈ {0,1},   u_k ∈ [1,N] continuous
 ```
 
-**V2 trade-off for elliptical cells:**
-- θ = φ maximizes score, but exit/entry geometry may be poor → high transit cost
-- θ ≠ φ slightly reduces score, but better geometry → lower transit → budget saved → possibly visit one more cell
-
-**V2 MILP (extended graph):** create a virtual node (i, k) for every (supercell i, theta index k) pair. Add a "one-config-per-cell" constraint: each physical supercell may be visited in at most one theta configuration. The MILP is exact over its T=6 grid.
-
-### V3 — Full Observation Parameter Optimization
-
-Extends V2 by also making **pattern geometry parameters** decision variables. As in V2, all parameters are discretized — no continuous optimization is performed by any algorithm.
-
-| Parameter | Cell type | Discrete values | # levels |
-|---|---|---|---|
-| θ | Both | {0°, 15°, …, 165°} | 12 |
-| L | Circular | r + {15, 35, 55, 75} km | 4 |
-| m | Elliptical | {2, 3, 4, 5} | 4 |
-| s | Elliptical | {10, 15, 20} km | 3 |
-
-Per-cell configuration space (all valid (θ, param) combos enumerated by `enum_configs()`):
-- Circular: 12 × 4 = **48 configurations**
-- Elliptical: 12 × 4 × 3 = **144 configurations**
-
-Greedy and ALNS both call `enum_configs()` to iterate over all configurations when inserting or locally improving a node. No MILP is formulated for V3 (extended graph would have N × 144 virtual nodes plus subtour constraints — intractable at scale).
-
-**V3 trade-off:** sparser patterns (fewer legs, smaller L) sacrifice a small amount of score per cell but free up flight budget to visit an additional high-value cell, yielding a net positive gain.
+Solved to **certified global optimality** via scipy / HiGHS backend.
 
 ---
 
 ## Algorithms
 
-### Summary Table
+### TSP Baseline (notebook 02)
 
-| Algorithm | Problem | Optimality | Complexity | Notes |
-|---|---|---|---|---|
-| Nearest Neighbor | TSP | Heuristic | O(N²) | ~71% above optimal on benchmark |
-| 2-opt | TSP | **Local optimum** | O(N²/iter) | Practical for N ≤ 30 |
-| Held-Karp DP | TSP | **Global optimum** | O(2^N · N²) | Exact, feasible N ≤ 20 |
-| MILP MTZ (CBC) | TSP, V2-OP | **Global optimum** | Exponential worst-case | Practical N ≤ ~20 |
-| Greedy ratio | V2/V3-OP | Heuristic | O(N²) | No optimality guarantee |
-| **ALNS** | V2/V3-OP | **Local optimum** (heuristic) | O(iter × N) | Near-optimal in practice |
+| Algorithm | Optimality | Complexity |
+|-----------|-----------|-----------|
+| Nearest Neighbor | Heuristic | O(N²) |
+| 2-opt local search | **2-optimal** local | O(N²) per pass |
+| Held-Karp DP | **Global optimum** | O(2^N · N²) |
+| MILP (MTZ + HiGHS) | **Global optimum** | Branch-and-bound |
 
-### Algorithm Descriptions
+### Orienteering Problem (notebook 03)
 
-#### Nearest Neighbor (NN)
-Greedy tour construction for TSP. Starting from the base, always fly to the nearest unvisited supercell; return to base at the end. Each step is O(N), total O(N²). Fast and simple, but locally greedy decisions lead to globally poor routes — typically 20–70% above optimal. Used here as a baseline and to calibrate the budget B (B = 55% of NN full-tour cost).
+| Algorithm | Optimality | Notes |
+|-----------|-----------|-------|
+| Exhaustive enumeration | **Global optimum** ✓ | Feasible only for N ≤ ~8 |
+| MILP (MTZ + HiGHS) | **Global optimum** ✓ | 42 binary + 6 continuous vars |
+| ALNS greedy init | Local optimum | Greedy construction + ALNS |
+| ALNS random init | Local optimum | Random start + ALNS |
 
-#### 2-opt Local Search
-Iterative improvement heuristic for TSP. At each pass, try all O(N²) pairs of edges; if reversing the segment between them shortens the total tour, accept the swap and restart. Repeat until no improving 2-swap exists. Converges to a **2-optimal** local solution: no single pair of edges can be swapped to improve the tour. In practice very effective — finds the optimal tour on this benchmark — but no global guarantee.
+### ALNS (Adaptive Large Neighbourhood Search)
 
-#### Held-Karp Dynamic Programming
-Exact TSP algorithm based on bitmask DP over subsets of nodes.
+State: ordered list of visited cells. Iteratively destroys part of the current solution
+and repairs it; operator selection probabilities adapt to historical performance.
 
-- **State:** `dp[S][v]` = minimum cost to start at base, visit exactly the nodes in set S, and end at node v
-- **Recurrence:** `dp[S][v] = min over u in S\{v} of  dp[S\{v}][u] + c[u][v]`
-- **Base case:** `dp[{v}][v] = c[0][v]`
-- **Answer:** `min over v of  dp[all nodes][v] + c[v][0]`
-- **Time:** O(2^N · N²), **Space:** O(2^N · N)
+**Destroy/repair operators:**
 
-Provably finds the **global optimum**. Practical for N ≤ ~20 (at N=20: ~117 ms; at N=25: ~30 s; at N=30: ~hours).
+| ID | Operator | Description |
+|----|----------|-------------|
+| D0 | rm1 + reinsert | Remove 1 random cell; greedily reinsert all unvisited by score/cost ratio |
+| D1 | swap_unvisited | Swap one visited cell with one random unvisited cell |
+| D2 | 2-opt | Reverse a random subsequence of the visit order |
+| D3 | rm2 + reinsert | Remove 2 random cells; greedily reinsert |
 
-#### MILP with MTZ Subtour Elimination
-Formulates the routing problem as a **Mixed-Integer Linear Program** solved by branch-and-bound (PuLP + CBC open-source solver).
-
-The key challenge in routing MILPs is preventing **subtours** — disconnected cycles that don't include the base. The **Miller-Tucker-Zemlin (MTZ)** formulation eliminates subtours compactly using a position variable u_i ∈ [1,N] per node with the single-constraint family:
-```
-u_i − u_j + N · x_{ij} ≤ N − 1    ∀ i ≠ j ≥ 1
-```
-This forces a consistent ordering of visited nodes, making disconnected subtours infeasible. The MILP is solved to **certified global optimality** (zero optimality gap) via branch-and-bound. Worst-case exponential, but practical for N ≤ ~20 with a good solver.
-
-**Why can V2 use MILP if θ is geometrically a continuous variable?**
-In this formulation, θ is **explicitly discretized** to a finite grid Θ = {0°, 15°, …, 165°} (T values) — this is a design choice, not a physical constraint. Each (supercell i, θ_k) pair is treated as a distinct virtual node in an extended graph. The V2 MILP then routes over these virtual nodes with standard binary arc variables and linear constraints — it is still a pure integer linear program.
-
-If θ were kept continuous, the transit cost c(exit(i, θ_i), entry(j, θ_j)) would be a **nonlinear** (trigonometric) function of θ_i and θ_j, turning the problem into a Mixed-Integer Nonlinear Program (MINLP) — far harder to solve globally. Discretization trades a coarser θ resolution for the ability to use efficient MILP solvers. ALNS uses T=12 (15° steps); MILP uses T=6 (30° steps) to keep the extended graph smaller.
-
-#### Greedy Ratio (for Orienteering Problem)
-Constructive heuristic for the OP. Maintains a current partial tour. At each step:
-1. For every unvisited supercell k, find the cheapest insertion position in the current tour (O(|tour|) per node)
-2. Compute the **ratio** score_k / Δ_k, where Δ_k is the additional distance from inserting k at its best position
-3. Insert the k with the highest ratio, if doing so keeps total distance ≤ B
-4. Repeat until no insertion is budget-feasible
-
-O(N²) total. Fast, no backtracking. Can be suboptimal because a greedy insertion at step t may block a higher-value combination at step t+1.
-
-#### ALNS (Adaptive Large Neighborhood Search)
-Metaheuristic for the OP, adapted for V1/V2/V3. Iteratively destroys part of the current solution and repairs it, using a **portfolio of operators** whose selection probabilities adapt based on historical performance.
-
-**Core loop (600 iterations for V2/V3):**
-```
-1. Destroy:   select operator D_i by weighted random draw; remove nodes from tour
-2. Repair:    select operator R_j by weighted random draw; reinsert removed nodes
-3. Local search (V2/V3): sweep all θ / (θ,L,m,s) configs for every visited node
-4. Update:    if new solution improves global best → weight[D_i] *= 1.20,  weight[R_j] *= 1.20
-              every iteration → all weights *= 0.98  (decay toward uniform)
-5. Accept:    always update working solution (random walk); keep global best separately
-```
-
-**Destroy operators:**
-- `rand_1` — remove 1 random node; explores broadly
-- `rand_2` — remove 2 random nodes; larger perturbation
-- `worst` — remove the node with the lowest score / marginal-savings ratio; targeted improvement
-
-**Repair operators:**
-- `greedy_ratio` — reinsert by score / insertion-cost ratio (same logic as greedy above)
-- `score_first` — greedily insert the highest-score node that fits within budget
-
-**V2 additions:**
-- `best_theta_for_insert` — at insertion time, scan all T θ values; pick (position, θ) jointly maximising score/cost
-- `theta_local_search` — post-repair: for each node in tour, try all T θ values; accept any score-improving θ swap that keeps distance ≤ B
-
-**V3 additions:**
-- `best_cfg_for_insert` — enumerate all (θ, L) or (θ, m, s) configs at insertion time
-- `param_ls` — post-repair: for each node, try all configs; accept improving ones
-
-ALNS can escape local optima via the destroy step (unlike pure local search), but **convergence to the global optimum is not guaranteed**. The random-walk acceptance criterion maintains solution diversity; the adaptive weights steer the search toward operators that have been productive.
-
-### Local vs Global Optimality — Summary by Problem Version
-
-| Problem | Algorithm | Optimality guarantee |
-|---|---|---|
-| TSP | Nearest Neighbor | None (heuristic) |
-| TSP | 2-opt | **2-optimal local optimum** |
-| TSP | Held-Karp DP | **Global optimum** ✓ |
-| TSP | MILP (MTZ + CBC) | **Global optimum** ✓ |
-| V2-OP | Greedy ratio | None (heuristic) |
-| V2-OP | MILP (extended graph) | **Global optimum over discretized θ grid** ✓ |
-| V2-OP | ALNS | Local optimum (no global guarantee) |
-| V3-OP | ALNS only | Local optimum (no global guarantee) |
-
-**Key caveats:**
-- All MILP results are optimal only within the **discretized** parameter space (finite θ grid). The underlying continuous problem has no known polynomial exact method.
-- V2 MILP uses T=6 while V2 ALNS uses T=12 — they solve slightly different discretized problems, which is why ALNS can outperform MILP here.
-- V3 has no exact method: the joint problem (selection + sequence + all parameters) is NP-hard with ~144 configs/cell.
+**Weight update:** improvement → weight × 1.2; every iteration → all weights × 0.98
+(exponential decay toward uniform); clipped to [0.1, 10].
 
 ---
 
-## Results
+## Benchmark Results
 
-All results use a scenario of **N = 6 supercells** (3 circular + 3 elliptical), budget B = 55% of the nearest-neighbor full-tour cost. Supercell placement uses rejection sampling with strict no-overlap guarantee: center separation > extent_i + extent_j + 15 km, where extent = radius (circular) or semi-major axis a (elliptical).
+**Scenario:** 6 supercells (3 circular + 3 elliptical), 2 obstacles, strict no-overlap.
+Cell weights: C1=1.8, C2=3.0, C3=2.0, E1=3.5, E2=2.5, E3=2.0.
 
-### TSP baseline (notebook 02, visit all N supercells)
+### TSP (visit all 6 cells)
 
-Results are re-generated upon running `02_tsp_all_visit.ipynb` with the current N=6 scenario.
+All exact algorithms agree on the same optimal transit cost. Results are regenerated
+on each run of `02_tsp_all_visit.ipynb`.
 
-| Algorithm | Optimality | Notes |
-|---|---|---|
-| Nearest Neighbor | Heuristic | Fast baseline |
-| 2-opt | Local optimum | Typically closes most of NN gap |
-| Held-Karp DP | **Global optimum** | Exact, very fast for N=6 |
-| MILP (MTZ + CBC) | **Global optimum** | Exact, certified zero gap |
+### Orienteering (budget-constrained subset selection)
 
-### V2-OP (notebook 03)
+Budget forces selection of exactly 4 out of 6 cells (midpoint between min 4-cell
+and min 5-cell tour costs = 2779 km).
 
-V2 optimizes scan direction θ alongside visit selection and order. Results are re-generated upon running `03_v2_orienteering.ipynb`.
+| Algorithm | Tour | Score | Dist (km) | Time | Optimal |
+|-----------|------|-------|-----------|------|---------|
+| Exhaustive | C2 → E2 → E1 → C3 | 12.1182 | 2682.4 | < 1 ms | ✓ |
+| MILP (HiGHS) | C2 → E2 → E1 → C3 | 12.1182 | 2682.4 | ~16 ms | ✓ |
+| ALNS greedy (5/5 seeds) | C2 → E2 → E1 → C3 | 12.1182 | 2682.4 | ~60 ms | ✓ |
+| ALNS random (10/10 seeds) | C2 → E2 → E1 → C3 | 12.1182 | 2682.4 | ~65 ms | ✓ |
 
-### V3-OP (notebook 04)
-
-V3 additionally optimizes pattern geometry parameters (L for circular, m/s for elliptical). Results are re-generated upon running `04_v3_orienteering.ipynb`.
+All algorithms recover the global optimum. The exhaustive enumeration proves global
+optimality; MILP independently confirms it with a certified zero optimality gap.
 
 ---
 
@@ -246,33 +164,39 @@ V3 additionally optimizes pattern geometry parameters (L for circular, m/s for e
 
 ```
 aerial-met-survey-optimizer/
-├── 00_simulation_data.ipynb              # Scenario generation (N=6, strict no-overlap)
-├── 01_supercell_concepts_and_visualization.ipynb  # Concepts, geometry, score functions
-├── 02_tsp_all_visit.ipynb                # TSP baseline: visit all supercells
-├── 03_v2_orienteering.ipynb              # V2-OP: optimize scan direction θ
-├── 04_v3_orienteering.ipynb              # V3-OP: optimize all pattern parameters
+├── 00_simulation_data.ipynb        # Define scenario → save data/scenario_N6_seed42.pkl
+├── 01_survey_patterns.ipynb        # Survey pattern concepts + score function analysis
+├── 02_tsp_all_visit.ipynb          # TSP baseline: NN / 2-opt / Held-Karp DP / MILP
+├── 03_orienteering.ipynb           # OP: precompute → exhaustive → MILP → ALNS
 ├── data/
-│   └── scenario_N6_seed42.pkl            # Serialized scenario
-└── figures/                              # Output visualizations
+│   └── scenario_N6_seed42.pkl      # Serialized 6-cell scenario
+└── figures/
+    ├── scenario_overview.png        # Cell layout with obstacles
+    ├── circular_pattern_demo.png    # Cross survey at 3 scan directions
+    ├── elliptical_pattern_demo.png  # Boustrophedon scan at 3 leg counts
+    ├── score_analysis.png           # Score vs n-legs and score vs survey-dist
+    ├── tsp_comparison.png           # TSP optimal route with survey patterns
+    ├── orienteering_route.png       # Full 6-cell route visualisation (all cells)
+    └── orienteering_comparison.png  # ALNS convergence + operator stats + score distribution
 ```
 
-| Notebook | Purpose |
-|---|---|
-| `00` | Generates a reproducible synthetic scenario: 3 circular + 3 elliptical supercells, no overlap |
-| `01` | Visualizes supercell patterns, derives score functions, demonstrates V2 concept |
-| `02` | Solves the TSP (visit-all) subproblem: Nearest Neighbor, 2-opt, Held-Karp DP, MILP |
-| `03` | Solves **V2-OP** (free θ): 4D transit tensor, V2 ALNS with θ local search, V2 MILP |
-| `04` | Solves **V3-OP** (free θ + L/m/s): ALNS with full config enumeration |
+| Notebook | Purpose | Run time |
+|----------|---------|----------|
+| `00` | Generate & save benchmark scenario (hardcoded, reproducible) | < 5 s |
+| `01` | Visualise survey patterns; explain score functions | < 30 s |
+| `02` | TSP on all 6 cells; compare 4 algorithms | < 10 s |
+| `03` | Full orienteering problem; exhaustive ground truth + MILP + ALNS | ~5 min |
 
 ---
 
 ## Installation
 
 ```bash
-pip install numpy matplotlib scipy pulp
+pip install numpy matplotlib scipy
 ```
 
-Python 3.8+ recommended. For faster MILP solving, a commercial solver (Gurobi, CPLEX) can replace the default CBC backend in PuLP.
+Python 3.10+ recommended. Uses `scipy.optimize.milp` (HiGHS backend; no external
+solver installation required).
 
 ---
 
@@ -281,28 +205,22 @@ Python 3.8+ recommended. For faster MILP solving, a commercial solver (Gurobi, C
 Run notebooks in order:
 
 ```bash
-jupyter notebook 00_simulation_data.ipynb
-jupyter notebook 01_supercell_concepts_and_visualization.ipynb
-jupyter notebook 02_tsp_all_visit.ipynb
-jupyter notebook 03_v2_orienteering.ipynb
-jupyter notebook 04_v3_orienteering.ipynb
+jupyter notebook 00_simulation_data.ipynb       # generates scenario pickle
+jupyter notebook 01_survey_patterns.ipynb        # pattern visualisations
+jupyter notebook 02_tsp_all_visit.ipynb          # TSP baseline
+jupyter notebook 03_orienteering.ipynb           # full OP solution
 ```
 
-To generate a different scenario, modify parameters in `00_simulation_data.ipynb`:
-
-```python
-N = 6               # total supercells (FRAC_CIRC=0.5 → 3 circular + 3 elliptical)
-FRAC_CIRC = 0.5     # fraction that are circular
-SEED = 42           # random seed for reproducibility
-OVERLAP_BUFFER = 15.0  # minimum separation buffer (km)
-```
+All notebooks load the scenario from `data/scenario_N6_seed42.pkl` (written by `00`).
+The scenario is hardcoded (not randomly generated) for full reproducibility.
 
 ---
 
 ## Potential Extensions
 
-- **Learning-Augmented ALNS (LA-ALNS):** replace the multiplicative weight update with a contextual bandit or RL policy trained on historical scenarios
-- **Real data:** replace synthetic supercells with actual NWP (numerical weather prediction) forecast fields
-- **Multi-aircraft:** extend to cooperative routing with multiple research aircraft sharing a budget
-- **Continuous θ optimization:** replace discrete grid with gradient-based or Bayesian optimization for scan direction
-- **Time-varying targets:** incorporate target motion forecasts (storm drift) into the routing model
+- **Larger N:** ALNS scales well; exhaustive ground truth becomes unavailable for N > 8
+- **Continuous parameter optimisation:** replace discrete (θ, L, n, s) grids with
+  gradient-based or Bayesian optimisation
+- **Real NWP data:** replace synthetic supercells with actual forecast fields
+- **Multi-aircraft:** cooperative routing with multiple research aircraft
+- **Time-varying targets:** incorporate storm motion forecasts into the routing model
