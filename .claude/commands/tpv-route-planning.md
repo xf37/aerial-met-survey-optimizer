@@ -262,3 +262,4 @@ build_route_m3(base, tpv_chords, T_sat_h, sat_first=False)
 3. Check git status and current branch; create new branch + PR if starting new work
 4. Read the relevant notebook cell(s) before editing
 5. Run notebook with full path to `python.exe` above
+# avatar test
