@@ -160,6 +160,24 @@ def route_dropsonde_dist(wpts, dropsonde_geom):
     return total
 
 
+# ── Satellite track interpolation ────────────────────────────────────────────
+def arc_interp(pts, cum, t):
+    k = int(np.searchsorted(cum, t, side='right')) - 1
+    k = max(0, min(len(pts) - 2, k))
+    frac = (t - cum[k]) / max(float(np.linalg.norm(pts[k + 1] - pts[k])), 1e-9)
+    return pts[k] + frac * (pts[k + 1] - pts[k])
+
+
+def sat_arc_waypoints(pa, arc_km, seg_pts, cum_arc, n_pts=60):
+    """Return dense intermediate points along satellite track from pa for arc_km."""
+    dists = np.linalg.norm(seg_pts - pa, axis=1)
+    k0    = int(np.argmin(dists))
+    t_e   = float(cum_arc[k0])
+    t_x   = min(t_e + arc_km, float(cum_arc[-1]))
+    ts    = np.linspace(t_e, t_x, max(n_pts, int(arc_km / 5) + 2))
+    return np.array([arc_interp(seg_pts, cum_arc, t) for t in ts])
+
+
 # ── Incremental graph extension ───────────────────────────────────────────────
 def extend_graph(cache, dynamic_pts):
     """Add dynamic_pts (chord endpoints + GPs) to the precomputed static graph.
@@ -365,7 +383,8 @@ def build_route_field(base, stops, T_sat_h,
 
     return dict(
         waypoints=np.array(wpts), seg_types=segs,
-        total_dist=eff_dist, tpv_dist=tpv_dist, coinc_dist=coinc_dist,
+        total_dist=eff_dist, geo_dist=geo_dist,
+        tpv_dist=tpv_dist, coinc_dist=coinc_dist,
         n_turns=n_turns, feasible=feasible,
         budget_remaining=TOTAL_BUDGET_KM - eff_dist, T_dep_h=T_dep_h,
     )
@@ -643,6 +662,8 @@ def main():
     sign   = '+' if offset >= 0 else ''
     drop_dist = route_dropsonde_dist(best_r['waypoints'], cache['dropsonde_union'])
     drop_min  = drop_dist / AC_SPEED * 60.0
+    flight_h  = best_r['geo_dist'] / AC_SPEED
+    flight_min = flight_h * 60.0
 
     print(f'\n{"="*60}')
     print(f'Total time: {t_total:.1f}s  (search {t_search:.1f}s)')
@@ -652,6 +673,8 @@ def main():
           + (f'  [extended from {arc_km_min:.0f} km ({coinc_orig_min:.0f} min)]'
              if arc_km_ext > arc_km_min + 1e-3 else ''))
     print(f'Dropsonde       : {drop_dist:.0f} km  ({drop_min:.0f} min)')
+    print(f'Total geo. dist : {best_r["geo_dist"]:.0f} km  '
+          f'| flight time: {flight_h:.2f} h  ({flight_min:.0f} min)')
     print(f'Total eff. dist : {best_r["total_dist"]:.0f} km  '
           f'(budget {TOTAL_BUD:.0f} km, remaining {best_r["budget_remaining"]:.0f} km)')
     print(f'Turns           : {best_r["n_turns"]}')
@@ -671,6 +694,8 @@ def main():
                     if arc_km_ext > arc_km_min + 1e-3 else '')
         f.write(f'Coincidence     : {arc_km_ext:.0f} km  ({coinc_min:.0f} min){ext_note}\n')
         f.write(f'Dropsonde       : {drop_dist:.0f} km  ({drop_min:.0f} min)\n')
+        f.write(f'Total geo. dist : {best_r["geo_dist"]:.0f} km\n')
+        f.write(f'Flight time     : {flight_h:.2f} h  ({flight_min:.0f} min)\n')
         f.write(f'Total eff. dist : {best_r["total_dist"]:.0f} km  '
                 f'(budget {TOTAL_BUD:.0f} km, remaining {best_r["budget_remaining"]:.0f} km)\n')
         f.write(f'Turns           : {best_r["n_turns"]}\n')
@@ -714,15 +739,26 @@ def main():
     ax.plot(st[:, 0], st[:, 1], color='gray', lw=1, ls='--',
             zorder=2, label='Satellite track')
 
-    # Route coloured by segment type
+    # Route coloured by segment type (skip 'sat' — drawn separately along track)
     seg_colors = {'transit': '#666666', 'tpv': '#0055cc', 'sat': '#cc0000'}
     wpts = best_r['waypoints']
     segs = best_r['seg_types']
     for k in range(len(wpts) - 1):
         seg = segs[k] if k < len(segs) else 'transit'
+        if seg == 'sat':
+            continue  # drawn below using actual track geometry
         col = seg_colors.get(seg, '#333333')
         ax.plot([wpts[k, 0], wpts[k + 1, 0]], [wpts[k, 1], wpts[k + 1, 1]],
                 color=col, lw=2.2, zorder=5)
+
+    # Satellite arc: draw along actual track geometry, not chord
+    if sat_entry_key is not None:
+        _seg_pts = cache['sat_track']['seg_pts']
+        _cum_arc = cache['sat_track']['cum_arc']
+        pa_best  = np.array(sat_entry_key)
+        arc_wpts = sat_arc_waypoints(pa_best, arc_km_ext, _seg_pts, _cum_arc)
+        ax.plot(arc_wpts[:, 0], arc_wpts[:, 1],
+                color='#cc0000', lw=2.5, zorder=6)
 
     # Waypoint markers
     ax.scatter(wpts[1:-1, 0], wpts[1:-1, 1], s=18, color='#333333', zorder=6)
@@ -745,8 +781,9 @@ def main():
     ax.set_ylabel('North (km)')
     ax.set_title(
         f'Route: {best_n} TPV chord(s) | coinc={arc_km_ext:.0f} km ({coinc_min:.0f} min) '
-        f'| dist={best_r["total_dist"]:.0f}/{TOTAL_BUD:.0f} km',
-        fontsize=11)
+        f'| geo={best_r["geo_dist"]:.0f} km ({flight_h:.1f} h) '
+        f'| eff={best_r["total_dist"]:.0f}/{TOTAL_BUD:.0f} km',
+        fontsize=10)
     ax.legend(loc='upper left', fontsize=8)
     ax.grid(True, lw=0.4, alpha=0.5)
 

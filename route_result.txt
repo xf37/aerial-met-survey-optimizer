@@ -1,11 +1,13 @@
 TPV shapefile   : C:/nasa-ffp-nurture/test_data/Contour_2_14_18_3.shp
 Gatepoints      : C:/nasa-ffp-nurture/test_data/gatepoints.shp
 Cache           : mission_cache.pkl
-Total time      : 784.3s  (search 782.1s)
+Total time      : 1339.8s  (search 1337.3s)
 n_chords        : 2
 TPV distance    : 642 km
 Coincidence     : 425 km  (30 min)  [extended from 85 km (6 min)]
 Dropsonde       : 1594 km  (113 min)
+Total geo. dist : 3276 km
+Flight time     : 3.85 h  (231 min)
 Total eff. dist : 3701 km  (budget 4250 km, remaining 549 km)
 Turns           : 4
 T_dep           : T_sat -3.36 h
