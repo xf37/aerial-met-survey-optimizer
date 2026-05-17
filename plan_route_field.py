@@ -751,14 +751,16 @@ def main():
         ax.plot([wpts[k, 0], wpts[k + 1, 0]], [wpts[k, 1], wpts[k + 1, 1]],
                 color=col, lw=2.2, zorder=5)
 
-    # Satellite arc: draw along actual track geometry, not chord
+    # Satellite arc: draw along actual track geometry as both flight path and coincidence overlay
     if sat_entry_key is not None:
         _seg_pts = cache['sat_track']['seg_pts']
         _cum_arc = cache['sat_track']['cum_arc']
         pa_best  = np.array(sat_entry_key)
         arc_wpts = sat_arc_waypoints(pa_best, arc_km_ext, _seg_pts, _cum_arc)
         ax.plot(arc_wpts[:, 0], arc_wpts[:, 1],
-                color='#cc0000', lw=2.5, zorder=6)
+                color='#666666', lw=2.2, zorder=5)   # flight path along satellite track
+        ax.plot(arc_wpts[:, 0], arc_wpts[:, 1],
+                color='#cc0000', lw=2.5, zorder=6)   # red overlay = satellite coincidence
 
     # Waypoint markers
     ax.scatter(wpts[1:-1, 0], wpts[1:-1, 1], s=18, color='#333333', zorder=6)
