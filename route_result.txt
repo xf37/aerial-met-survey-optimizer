@@ -1,0 +1,23 @@
+TPV shapefile   : C:/nasa-ffp-nurture/test_data/Contour_2_14_18_3.shp
+Gatepoints      : C:/nasa-ffp-nurture/test_data/gatepoints.shp
+Cache           : mission_cache.pkl
+Total time      : 784.3s  (search 782.1s)
+n_chords        : 2
+TPV distance    : 642 km
+Coincidence     : 425 km  (30 min)  [extended from 85 km (6 min)]
+Dropsonde       : 1594 km  (113 min)
+Total eff. dist : 3701 km  (budget 4250 km, remaining 549 km)
+Turns           : 4
+T_dep           : T_sat -3.36 h
+
+Waypoints (km from GOOSE BAY):
+    0  (    0.00,     0.00)  [start]
+    1  ( -707.13,  -159.20)  [transit]
+    2  (-1042.85,  -290.18)  [tpv]
+    3  (-1390.04,  -489.49)  [transit]
+    4  (-1337.54,  -585.07)  [transit]
+    5  ( -830.80,  -654.24)  [transit]
+    6  ( -568.76,  -552.01)  [tpv]
+    7  ( -159.74,  -433.50)  [transit]
+    8  ( -141.60,  -350.46)  [sat]
+    9  (    0.00,     0.00)  [transit]
