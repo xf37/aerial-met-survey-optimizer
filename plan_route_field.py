@@ -42,7 +42,7 @@ SPACING_OVERRIDE_KM    = 100      # None = auto from PCA b_fit
 MAX_ANGLE_DEV_DEG      = 5.0
 N_ANGLE_SAMPLES        = 3
 ASPECT_RATIO_THRESHOLD = 1.3
-TURN_THRESHOLD_DEG     = 10.0
+TURN_THRESHOLD_DEG     = 0.0   # any direction change incurs the full penalty
 MIN_LEG_SPACING_KM     = 50.0
 MAX_JOINT_N            = 4
 SAT_PROX_FACTOR        = 0.6      # satellite midpoint within (remaining_budget × factor) of TPV
@@ -372,24 +372,22 @@ def build_route_field(base, stops, T_sat_h,
             pos = exit_
 
         elif stype == 'sat':
-            sa = np.asarray(stop['pt_a'], float)
-            sb = np.asarray(stop['pt_b'], float)
+            # pt_a = pa = arc ENTRY (satellite natural start, forward direction)
+            # pt_b = pb = arc EXIT  (satellite natural end, forward direction)
+            # Aircraft MUST fly in satellite's direction: pa -> pb (increasing t).
+            sa = np.asarray(stop['pt_a'], float)  # entry
+            sb = np.asarray(stop['pt_b'], float)  # exit
             sl = stop['length']
-            cost_a, wpts_a = transit(pos, sa)
-            cost_b, wpts_b = transit(pos, sb)
-            if cost_a <= cost_b:
-                entry, exit_, eff_t, t_wpts = sa, sb, cost_a, wpts_a
-            else:
-                entry, exit_, eff_t, t_wpts = sb, sa, cost_b, wpts_b
-            if eff_t == float('inf'): return None
+            cost, t_wpts = transit(pos, sa)
+            if cost == float('inf'): return None
             geo_t = sum(float(np.linalg.norm(t_wpts[k+1]-t_wpts[k]))
                         for k in range(len(t_wpts)-1))
-            eff_dist += eff_t; geo_dist += geo_t
+            eff_dist += cost; geo_dist += geo_t
             for wp in t_wpts[1:]: wpts.append(wp); segs.append('transit')
             geo_to_sat_mid = geo_dist + sl / 2.0
             coinc_dist = sl; eff_dist += sl; geo_dist += sl
-            wpts.append(exit_); segs.append('sat')
-            pos = exit_
+            wpts.append(sb); segs.append('sat')
+            pos = sb
 
     ret_cost, ret_wpts = transit(pos, base)
     if ret_cost == float('inf'): return None
@@ -462,7 +460,14 @@ def find_best_route_field(base, chords, gatepoints_km, sat_cands,
                             c_t = sp_full[pos_i].get(ia, 1e18) if ia is not None else 1e18
                             if c_t >= 1e17: ok = False; break
                             approx += c_t; pos_i = ia
+                        elif s['type'] == 'sat':
+                            # Satellite: always enter at ia (pt_a=pa), exit at ib (pt_b=pb)
+                            ca = sp_full[pos_i].get(ia, 1e18) if ia is not None else 1e18
+                            if ca >= 1e17: ok = False; break
+                            approx += ca + s['length']
+                            pos_i = ib  # always exit at pb (forward direction)
                         else:
+                            # Chord: can fly in either direction (pick cheaper entry)
                             ca = sp_full[pos_i].get(ia, 1e18) if ia is not None else 1e18
                             cb = sp_full[pos_i].get(ib, 1e18) if ib is not None else 1e18
                             best_c = min(ca, cb)
