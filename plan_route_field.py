@@ -168,6 +168,30 @@ def arc_interp(pts, cum, t):
     return pts[k] + frac * (pts[k + 1] - pts[k])
 
 
+def find_t_on_track(pt, seg_pts, cum_arc):
+    """Project pt onto the satellite track via perpendicular projection.
+    Returns a precise arc-length t (more accurate than nearest-vertex lookup).
+    """
+    pt = np.asarray(pt, float)
+    dists = np.linalg.norm(seg_pts - pt, axis=1)
+    k_near = int(np.argmin(dists))
+    best_t = float(cum_arc[k_near])
+    best_d = float(dists[k_near])
+    for k in range(max(0, k_near - 3), min(len(seg_pts) - 1, k_near + 4)):
+        ab = seg_pts[k + 1] - seg_pts[k]
+        ab2 = float(np.dot(ab, ab))
+        if ab2 < 1e-12:
+            continue
+        frac = float(np.dot(pt - seg_pts[k], ab)) / ab2
+        frac_c = max(0.0, min(1.0, frac))
+        proj = seg_pts[k] + frac_c * ab
+        d = float(np.linalg.norm(pt - proj))
+        if d < best_d:
+            best_d = d
+            best_t = float(cum_arc[k]) + frac_c * float(np.linalg.norm(ab))
+    return best_t
+
+
 def sat_arc_waypoints(pa, arc_km, seg_pts, cum_arc, n_pts=60):
     """Return dense intermediate points along satellite track from pa for arc_km."""
     dists = np.linalg.norm(seg_pts - pa, axis=1)
@@ -723,15 +747,40 @@ def main():
     ax.plot(tpv_closed[:, 0], tpv_closed[:, 1],
             color='#2266cc', lw=1.5, zorder=3, label='TPV contour')
 
-    # Satellite track
-    st = cache['sat_track']['seg_pts']
-    ax.plot(st[:, 0], st[:, 1], color='gray', lw=1, ls='--',
-            zorder=2, label='Satellite track')
+    # Pre-compute satellite arc t values for track clipping
+    _seg_pts = cache['sat_track']['seg_pts']
+    _cum_arc = cache['sat_track']['cum_arc']
+    wpts = best_r['waypoints']
+    segs = best_r['seg_types']
+    sat_k = next((k for k in range(len(segs)) if segs[k] == 'sat'), None)
+    t_sat_entry = t_sat_exit = None
+    if sat_k is not None:
+        sat_entry_pt = wpts[sat_k].copy()
+        sat_exit_pt  = wpts[sat_k + 1].copy()
+        t_sat_entry = find_t_on_track(sat_entry_pt, _seg_pts, _cum_arc)
+        t_sat_exit  = find_t_on_track(sat_exit_pt,  _seg_pts, _cum_arc)
+
+    # Satellite track: draw only the portions outside the coincidence arc
+    if t_sat_entry is not None:
+        t_lo, t_hi = min(t_sat_entry, t_sat_exit), max(t_sat_entry, t_sat_exit)
+        trk_kw = dict(color='gray', lw=1, ls='--', zorder=2)
+        if t_lo > _cum_arc[0] + 1.0:
+            n_b = max(20, int(t_lo / 20))
+            bpts = np.array([arc_interp(_seg_pts, _cum_arc, t)
+                             for t in np.linspace(float(_cum_arc[0]), t_lo, n_b)])
+            ax.plot(bpts[:, 0], bpts[:, 1], **trk_kw, label='Satellite track')
+        if t_hi < float(_cum_arc[-1]) - 1.0:
+            n_a = max(20, int((float(_cum_arc[-1]) - t_hi) / 20))
+            apts = np.array([arc_interp(_seg_pts, _cum_arc, t)
+                             for t in np.linspace(t_hi, float(_cum_arc[-1]), n_a)])
+            ax.plot(apts[:, 0], apts[:, 1], **trk_kw)
+    else:
+        st = _seg_pts
+        ax.plot(st[:, 0], st[:, 1], color='gray', lw=1, ls='--',
+                zorder=2, label='Satellite track')
 
     # Route coloured by segment type (skip 'sat' — drawn separately along track)
     seg_colors = {'transit': '#666666', 'tpv': '#0055cc', 'sat': '#cc0000'}
-    wpts = best_r['waypoints']
-    segs = best_r['seg_types']
     for k in range(len(wpts) - 1):
         seg = segs[k] if k < len(segs) else 'transit'
         if seg == 'sat':
@@ -740,18 +789,10 @@ def main():
         ax.plot([wpts[k, 0], wpts[k + 1, 0]], [wpts[k, 1], wpts[k + 1, 1]],
                 color=col, lw=2.2, zorder=5)
 
-    # Satellite arc: draw along actual track geometry using actual entry/exit waypoints
-    sat_k = next((k for k in range(len(segs)) if segs[k] == 'sat'), None)
-    if sat_k is not None:
-        _seg_pts = cache['sat_track']['seg_pts']
-        _cum_arc = cache['sat_track']['cum_arc']
-        sat_entry_pt = wpts[sat_k].copy()    # actual entry — connects to previous transit
-        sat_exit_pt  = wpts[sat_k + 1].copy()  # actual exit — connects to next transit
-        # Find arc positions of entry/exit on satellite track
-        t_entry = float(_cum_arc[int(np.argmin(np.linalg.norm(_seg_pts - sat_entry_pt, axis=1)))])
-        t_exit  = float(_cum_arc[int(np.argmin(np.linalg.norm(_seg_pts - sat_exit_pt,  axis=1)))])
-        n_pts   = max(80, int(arc_km_ext / 5) + 2)
-        ts      = np.linspace(t_entry, t_exit, n_pts)
+    # Satellite coincidence arc: draw along actual track geometry
+    if sat_k is not None and t_sat_entry is not None:
+        n_pts    = max(80, int(arc_km_ext / 5) + 2)
+        ts       = np.linspace(t_sat_entry, t_sat_exit, n_pts)
         arc_wpts = np.array([arc_interp(_seg_pts, _cum_arc, t) for t in ts])
         arc_wpts[0]  = sat_entry_pt   # force exact connection at entry
         arc_wpts[-1] = sat_exit_pt    # force exact connection at exit
