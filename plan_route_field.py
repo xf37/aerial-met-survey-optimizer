@@ -740,12 +740,21 @@ def main():
         ax.plot([wpts[k, 0], wpts[k + 1, 0]], [wpts[k, 1], wpts[k + 1, 1]],
                 color=col, lw=2.2, zorder=5)
 
-    # Satellite arc: draw along actual track geometry as both flight path and coincidence overlay
-    if sat_entry_key is not None:
+    # Satellite arc: draw along actual track geometry using actual entry/exit waypoints
+    sat_k = next((k for k in range(len(segs)) if segs[k] == 'sat'), None)
+    if sat_k is not None:
         _seg_pts = cache['sat_track']['seg_pts']
         _cum_arc = cache['sat_track']['cum_arc']
-        pa_best  = np.array(sat_entry_key)
-        arc_wpts = sat_arc_waypoints(pa_best, arc_km_ext, _seg_pts, _cum_arc)
+        sat_entry_pt = wpts[sat_k].copy()    # actual entry — connects to previous transit
+        sat_exit_pt  = wpts[sat_k + 1].copy()  # actual exit — connects to next transit
+        # Find arc positions of entry/exit on satellite track
+        t_entry = float(_cum_arc[int(np.argmin(np.linalg.norm(_seg_pts - sat_entry_pt, axis=1)))])
+        t_exit  = float(_cum_arc[int(np.argmin(np.linalg.norm(_seg_pts - sat_exit_pt,  axis=1)))])
+        n_pts   = max(80, int(arc_km_ext / 5) + 2)
+        ts      = np.linspace(t_entry, t_exit, n_pts)
+        arc_wpts = np.array([arc_interp(_seg_pts, _cum_arc, t) for t in ts])
+        arc_wpts[0]  = sat_entry_pt   # force exact connection at entry
+        arc_wpts[-1] = sat_exit_pt    # force exact connection at exit
         ax.plot(arc_wpts[:, 0], arc_wpts[:, 1],
                 color='#666666', lw=2.2, zorder=5)   # flight path along satellite track
         ax.plot(arc_wpts[:, 0], arc_wpts[:, 1],
