@@ -408,6 +408,7 @@ def find_best_route_field(base, chords, gatepoints_km, sat_cands,
 
     best = None; best_n = 0; best_coinc = -1.0; best_total = 1e18
     best_sat_entry_key = None
+    best_stop_list = None
 
     for n in range(min(len(chords), max_n), 0, -1):
         found = False
@@ -450,8 +451,9 @@ def find_best_route_field(base, chords, gatepoints_km, sat_cands,
                     approx += rc
                     if approx > TOTAL_BUDGET_KM: continue
 
+                    ordered = [all_stops[k] for k in perm]
                     r = build_route_field(
-                        base, [all_stops[k] for k in perm], T_sat_h,
+                        base, ordered, T_sat_h,
                         full_nodes, sp_full, prev_full, node_key, n_static,
                         TOTAL_BUDGET_KM, AIRCRAFT_SPEED_KMH, TURN_PENALTY_KM)
                     if r and r['feasible']:
@@ -463,18 +465,23 @@ def find_best_route_field(base, chords, gatepoints_km, sat_cands,
                             best_total = r['total_dist']
                             best = r; best_n = n; found = True
                             best_sat_entry_key = tuple(np.round(pa, 3))
+                            best_stop_list = ordered
         if found:
-            return best, best_n, best_sat_entry_key
-    return None, 0, None
+            return best, best_n, best_sat_entry_key, best_stop_list
+    return None, 0, None, None
 
 
 # ── Method A: post-hoc satellite arc extension ────────────────────────────────
 def extend_satellite_arc(best_route, best_stop_list, sat_arc_variants,
-                         sat_entry_key, T_sat_h,
+                         sat_entry_key, T_sat_h, base,
                          full_nodes, sp_full, prev_full, node_key, n_static,
                          TOTAL_BUDGET_KM, AIRCRAFT_SPEED_KMH, TURN_PENALTY_KM):
-    """Replace the satellite stop in best_stop_list with longer arcs until budget is exceeded.
-    Returns the best (route, arc_km) — longest feasible coincidence.
+    """Replace the satellite stop in best_stop_list with longer arcs.
+
+    For each longer arc variant from the same entry point, rebuilds the full
+    route using build_route_field so that the new exit transit and turn
+    penalties are correctly accounted for.
+    Returns (best_route, best_arc_km).
     """
     variants = sat_arc_variants.get(sat_entry_key, [])
     if len(variants) <= 1:
@@ -483,17 +490,16 @@ def extend_satellite_arc(best_route, best_stop_list, sat_arc_variants,
     best_r   = best_route
     best_arc = best_route['coinc_dist']
 
-    # Find which stop is the satellite stop
     sat_idx = next((i for i, s in enumerate(best_stop_list) if s['type'] == 'sat'), None)
     if sat_idx is None:
         return best_route, best_arc
 
     for pb_ext, arc_km in variants:
         if arc_km <= best_arc + 1e-6:
-            continue  # already covered by current best
+            continue
         pb_key = tuple(np.round(pb_ext, 3))
         if pb_key not in node_key:
-            continue  # exit point not in graph (shouldn't happen)
+            continue
 
         new_stops = list(best_stop_list)
         new_stops[sat_idx] = {
@@ -505,7 +511,7 @@ def extend_satellite_arc(best_route, best_stop_list, sat_arc_variants,
             'idx_b': node_key[pb_key],
         }
         r = build_route_field(
-            np.zeros(2), new_stops, T_sat_h,
+            base, new_stops, T_sat_h,
             full_nodes, sp_full, prev_full, node_key, n_static,
             TOTAL_BUDGET_KM, AIRCRAFT_SPEED_KMH, TURN_PENALTY_KM)
         if r and r['feasible']:
@@ -612,7 +618,7 @@ def main():
     # ── Search ────────────────────────────────────────────────────────────────
     print(f'\nSearching (max_n={MAX_JOINT_N})...')
     t0 = time.time()
-    best_r, best_n, sat_entry_key = find_best_route_field(
+    best_r, best_n, sat_entry_key, best_stop_list = find_best_route_field(
         BASE, chords, gatepoints_km, sat_filtered, T_SAT_H,
         full_nodes, sp_full, prev_full, node_key, n_static,
         TOTAL_BUD, AC_SPEED, TURN_PEN,
@@ -625,34 +631,17 @@ def main():
         return
 
     # ── Method A: extend satellite arc post-hoc ───────────────────────────────
-    # Reconstruct the stop list for the best route to pass to extend_satellite_arc.
-    # Rather than storing the full stop list during search (complex), we do a single
-    # re-build of the best route and try longer arcs directly.
+    # For each longer arc variant from the same entry, rebuild the full route so
+    # that the new exit transit distance and turn penalties are correctly computed.
     arc_km_min = best_r['coinc_dist']
-    arc_km_ext = arc_km_min
-
-    if sat_entry_key and sat_entry_key in cache['sat_arc_variants']:
-        variants = cache['sat_arc_variants'][sat_entry_key]
-        # Find entry point and current exit
-        pa_best = np.array(sat_entry_key)
-        # Try each longer arc from this entry
-        for pb_ext, arc_km in variants:
-            if arc_km <= arc_km_ext + 1e-6:
-                continue
-            pb_key = tuple(np.round(pb_ext, 3))
-            if pb_key not in node_key:
-                continue
-            # Quick budget check: can this arc even fit?
-            budget_spare = best_r['budget_remaining'] - (arc_km - arc_km_min)
-            if budget_spare < -TURN_PEN:  # rough check; turn count might change
-                break
-            # For simplicity: swap the sat stop in the best route's waypoint budget
-            # A full re-search with this arc would be slow; instead use budget_remaining
-            # to confirm feasibility (conservative: doesn't account for transit change).
-            if best_r['budget_remaining'] >= arc_km - arc_km_min:
-                arc_km_ext = arc_km
-            else:
-                break
+    print(f'Method A: extending satellite arc from {arc_km_min:.0f} km...')
+    t0 = time.time()
+    best_r, arc_km_ext = extend_satellite_arc(
+        best_r, best_stop_list, cache['sat_arc_variants'],
+        sat_entry_key, T_SAT_H, BASE,
+        full_nodes, sp_full, prev_full, node_key, n_static,
+        TOTAL_BUD, AC_SPEED, TURN_PEN)
+    print(f'Method A done: {arc_km_min:.0f} -> {arc_km_ext:.0f} km  [{time.time()-t0:.1f}s]')
 
     # ── Results ───────────────────────────────────────────────────────────────
     t_total = time.time() - t_start
