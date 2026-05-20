@@ -42,7 +42,7 @@ SPACING_OVERRIDE_KM    = 100      # None = auto from PCA b_fit
 MAX_ANGLE_DEV_DEG      = 5.0
 N_ANGLE_SAMPLES        = 3
 ASPECT_RATIO_THRESHOLD = 1.3
-TURN_THRESHOLD_DEG     = 0.0   # any direction change incurs the full penalty
+TURN_THRESHOLD_DEG     = 30.0  # turns > 30° incur TURN_PENALTY_KM; smaller heading changes are free
 MIN_LEG_SPACING_KM     = 50.0
 MAX_JOINT_N            = 4
 SAT_PROX_FACTOR        = 0.6      # satellite midpoint within (remaining_budget × factor) of TPV
