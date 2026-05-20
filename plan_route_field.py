@@ -5,13 +5,13 @@ Loads mission_cache.pkl (built by precompute_mission.py), then:
   1. Reads a new TPV contour shapefile → PCA ellipse fit → candidate chords
   2. Adds chord endpoints + gatepoints as dynamic nodes to the precomputed graph
      (Dijkstra from dynamic nodes only; static-static SP reused from cache)
-  3. Proximity-filters satellite candidates: keeps only those reachable from the
-     TPV region within the remaining budget
-  4. Searches: max n_chords → max coincidence → min total distance
-     Uses minimum-arc (85 km) candidates so the search space stays small
-  5. Method A post-hoc extension: for the best route found, tries every longer
-     satellite arc from the same entry point (stored in sat_arc_variants) and
-     takes the maximum arc that still satisfies the budget
+  3. Builds a full numpy distance matrix D[i,j] from the SP tables for fast lookups
+  4. Proximity-filters satellite candidates: keeps only those reachable from the
+     TPV region within the remaining budget; sorted by max arc length (descending)
+  5. Computes n_max_budget: ellipse lower bound to skip infeasible n values early
+  6. Searches: max n_chords → max coincidence
+     - turn-penalty-adjusted approx check filters infeasible perms cheaply
+     - inline Method A: tries max arc first, shrinks if over budget
 
 Usage:
     python plan_route_field.py <tpv_shapefile> [gatepoints_shapefile]
@@ -414,19 +414,17 @@ def build_route_field(base, stops, T_sat_h,
 
 # ── Joint optimiser ───────────────────────────────────────────────────────────
 def find_best_route_field(base, chords, gatepoints_km, sat_cands,
-                          sat_arc_variants,
+                          sat_arc_variants, D,
                           T_sat_h, full_nodes, sp_full, prev_full, node_key, n_static,
                           TOTAL_BUDGET_KM, AIRCRAFT_SPEED_KMH, TURN_PENALTY_KM,
                           min_spacing=MIN_LEG_SPACING_KM, max_n=MAX_JOINT_N):
     """Max n_chords → max coincidence (no distance tiebreaker).
 
-    For every feasible minimum-arc route, the satellite arc is immediately extended
-    to the maximum feasible length (inline Method A).  Routes are ranked solely by:
-      1. n_chords  (descending)
-      2. max achievable coincidence  (descending)
-    sat_cands: min-arc candidates after proximity filtering.
-    sat_arc_variants: pa_key -> [(pb, arc_km), ...] sorted by increasing arc_km.
-    Returns (best_route, best_n, best_sat_entry_key, best_stop_list).
+    Key optimisations vs. the original:
+      - numpy D matrix replaces dict lookups in the approx-check hot path
+      - turn-penalty-adjusted budget threshold filters infeasible perms early
+      - sat candidates pre-sorted by max arc; max-arc-first Method A
+      - prune: sat entry whose max arc ≤ best_coinc is skipped entirely
     """
     from itertools import permutations as _iperms
 
@@ -434,6 +432,14 @@ def find_best_route_field(base, chords, gatepoints_km, sat_cands,
     gp_stops = [{'type': 'gp', 'pt': np.asarray(gp),
                  'idx': node_key.get(tuple(np.round(gp, 3)))}
                 for gp in gatepoints_km]
+
+    # Pre-augment sat_cands with (pa, pb_min, arc_min, pb_max, arc_max, variants)
+    sat_cands_ext = []
+    for pa, pb_min, arc_min in sat_cands:
+        pa_key = tuple(np.round(pa, 3))
+        variants = sat_arc_variants.get(pa_key, [(pb_min, arc_min)])
+        pb_max, arc_max = variants[-1]
+        sat_cands_ext.append((pa, pb_min, arc_min, pb_max, arc_max, pa_key, variants))
 
     best = None; best_n = 0; best_coinc = -1.0
     best_sat_entry_key = None
@@ -452,62 +458,59 @@ def find_best_route_field(base, chords, gatepoints_km, sat_cands,
                             'length': c['length']}
                            for c in combo]
 
-            for pa, pb, arc_km in sat_cands:
-                pa_key = tuple(np.round(pa, 3))
+            for pa, pb_min, arc_min, pb_max, arc_max, pa_key, variants in sat_cands_ext:
                 # Prune: skip entry if its max arc can't beat current best
-                variants = sat_arc_variants.get(pa_key, [(pb, arc_km)])
-                if variants[-1][1] <= best_coinc + 1e-6:
+                if arc_max <= best_coinc + 1e-6:
                     continue
 
-                sat_stop = {'type': 'sat', 'pt_a': pa, 'pt_b': pb, 'length': arc_km,
+                # Use max arc in sat_stop so approx check is conservative
+                sat_stop = {'type': 'sat',
+                            'pt_a': pa, 'pt_b': pb_max, 'length': arc_max,
                             'idx_a': node_key.get(tuple(np.round(pa, 3))),
-                            'idx_b': node_key.get(tuple(np.round(pb, 3)))}
+                            'idx_b': node_key.get(tuple(np.round(pb_max, 3)))}
                 all_stops = gp_stops + chord_stops + [sat_stop]
+                n_stops = len(all_stops)
 
-                for perm in _iperms(range(len(all_stops))):
+                # Tighten budget for approx check: reserve minimum turn penalties
+                approx_budget = TOTAL_BUDGET_KM - n_stops * TURN_PENALTY_KM
+
+                for perm in _iperms(range(n_stops)):
                     pos_i = base_idx; approx = 0.0; ok = True
                     for s in (all_stops[k] for k in perm):
                         ia = s.get('idx') if s['type'] == 'gp' else s.get('idx_a')
                         ib = s.get('idx_b')
                         if s['type'] == 'gp':
-                            c_t = sp_full[pos_i].get(ia, 1e18) if ia is not None else 1e18
+                            c_t = D[pos_i, ia] if ia is not None else 1e18
                             if c_t >= 1e17: ok = False; break
                             approx += c_t; pos_i = ia
                         elif s['type'] == 'sat':
-                            # Satellite: always enter at ia (pt_a=pa), exit at ib (pt_b=pb)
-                            ca = sp_full[pos_i].get(ia, 1e18) if ia is not None else 1e18
+                            ca = D[pos_i, ia] if ia is not None else 1e18
                             if ca >= 1e17: ok = False; break
                             approx += ca + s['length']
-                            pos_i = ib  # always exit at pb (forward direction)
+                            pos_i = ib
                         else:
-                            # Chord: can fly in either direction (pick cheaper entry)
-                            ca = sp_full[pos_i].get(ia, 1e18) if ia is not None else 1e18
-                            cb = sp_full[pos_i].get(ib, 1e18) if ib is not None else 1e18
+                            ca = D[pos_i, ia] if ia is not None else 1e18
+                            cb = D[pos_i, ib] if ib is not None else 1e18
                             best_c = min(ca, cb)
                             if best_c >= 1e17: ok = False; break
                             approx += best_c + s['length']
                             pos_i = ib if ca <= cb else ia
                     if not ok: continue
-                    rc = sp_full[pos_i].get(base_idx, 1e18)
+                    rc = D[pos_i, base_idx]
                     if rc >= 1e17: continue
                     approx += rc
-                    if approx > TOTAL_BUDGET_KM: continue
+                    if approx > approx_budget: continue
 
                     ordered = [all_stops[k] for k in perm]
-                    r = build_route_field(
-                        base, ordered, T_sat_h,
-                        full_nodes, sp_full, prev_full, node_key, n_static,
-                        TOTAL_BUDGET_KM, AIRCRAFT_SPEED_KMH, TURN_PENALTY_KM)
-                    if not (r and r['feasible']):
-                        continue
+                    sat_idx_in = next(i for i, s in enumerate(ordered)
+                                      if s['type'] == 'sat')
 
-                    # Inline Method A: extend satellite arc to maximum feasible length.
-                    sat_idx_in = next(i for i, s in enumerate(ordered) if s['type'] == 'sat')
-                    r_ext, arc_ext = r, r['coinc_dist']
-                    ext_stop_list = list(ordered)
-                    for pb_v, arc_v in variants:
-                        if arc_v <= arc_ext + 1e-6:
-                            continue
+                    # Method A: try max arc first, shrink if infeasible
+                    r_ext = None; arc_ext = 0.0; ext_stop_list = None
+
+                    for pb_v, arc_v in reversed(variants):
+                        if arc_v <= best_coinc + 1e-6:
+                            break  # remaining variants can't beat current best
                         pb_key = tuple(np.round(pb_v, 3))
                         if pb_key not in node_key:
                             continue
@@ -525,16 +528,16 @@ def find_best_route_field(base, chords, gatepoints_km, sat_cands,
                             full_nodes, sp_full, prev_full, node_key, n_static,
                             TOTAL_BUDGET_KM, AIRCRAFT_SPEED_KMH, TURN_PENALTY_KM)
                         if r2 and r2['feasible']:
-                            r_ext, arc_ext = r2, arc_v
+                            r_ext = r2; arc_ext = arc_v
                             ext_stop_list = new_stops
-                        else:
-                            break  # longer arcs also exceed budget
+                            break  # max feasible arc found (going max→min, first hit = best)
 
-                    if arc_ext > best_coinc + 1e-6:
+                    if r_ext is not None and arc_ext > best_coinc + 1e-6:
                         best_coinc = arc_ext
                         best = r_ext; best_n = n; found = True
                         best_sat_entry_key = pa_key
                         best_stop_list = ext_stop_list
+
         if found:
             return best, best_n, best_sat_entry_key, best_stop_list
     return None, 0, None, None
@@ -659,6 +662,25 @@ def main():
     print(f'Chords: {len(chords)} (a={a_fit:.0f} b={b_fit:.0f} km, '
           f'spacing={min_spacing:.0f} km)  [{time.time()-t0:.1f}s]')
 
+    # Quick upper bound on feasible n_chords via ellipse geometry lower bound
+    d_base_to_near = max(0.0, np.linalg.norm(tpv_centroid - BASE) - a_fit)
+    avg_chord_len = 2.0 * b_fit
+    n_max_budget = MAX_JOINT_N
+    for _n in range(MAX_JOINT_N, 0, -1):
+        _n_stops = _n + len(gatepoints_km) + 1
+        _lb = (2.0 * d_base_to_near
+               + _n * avg_chord_len
+               + max(0, _n - 1) * min_spacing
+               + 85.0
+               + _n_stops * TURN_PEN)
+        if _lb <= TOTAL_BUD:
+            n_max_budget = _n
+            break
+    else:
+        n_max_budget = 1
+    n_max_budget = min(n_max_budget, len(chords), MAX_JOINT_N)
+    print(f'n_max (ellipse lower bound): {n_max_budget}')
+
     # ── Extend graph with dynamic nodes ───────────────────────────────────────
     t0 = time.time()
     dynamic_pts  = [c['pt_a'] for c in chords] + [c['pt_b'] for c in chords]
@@ -668,6 +690,16 @@ def main():
     n_new = len(full_nodes) - cache['n_static']
     print(f'Graph extended: +{n_new} dynamic nodes -> {len(full_nodes)} total  '
           f'[{time.time()-t0:.1f}s]')
+
+    # Build numpy distance matrix from sp_full (replaces dict lookups in hot path)
+    t0 = time.time()
+    N_full = len(full_nodes)
+    D = np.full((N_full, N_full), 1e18, dtype=np.float64)
+    for i in range(N_full):
+        for j, v in sp_full[i].items():
+            D[i, j] = v
+    np.fill_diagonal(D, 0.0)
+    print(f'Distance matrix: {N_full}×{N_full} built  [{time.time()-t0:.1f}s]')
 
     # ── Proximity-filter satellite candidates ─────────────────────────────────
     d_base_tpv      = float(np.linalg.norm(tpv_centroid - BASE))
@@ -684,14 +716,20 @@ def main():
         print(f'Sat candidates: {len(sat_all)} -> {len(sat_filtered)} '
               f'(proximity radius={sat_radius:.0f} km from TPV)')
 
+    # Sort by maximum achievable arc descending so best candidates prune others early
+    sat_filtered.sort(
+        key=lambda c: cache['sat_arc_variants'].get(
+            tuple(np.round(c[0], 3)), [(c[1], c[2])])[-1][1],
+        reverse=True)
+
     # ── Search ────────────────────────────────────────────────────────────────
-    print(f'\nSearching (max_n={MAX_JOINT_N})...')
+    print(f'\nSearching (max_n={n_max_budget})...')
     t0 = time.time()
     best_r, best_n, sat_entry_key, best_stop_list = find_best_route_field(
-        BASE, chords, gatepoints_km, sat_filtered, cache['sat_arc_variants'], T_SAT_H,
+        BASE, chords, gatepoints_km, sat_filtered, cache['sat_arc_variants'], D, T_SAT_H,
         full_nodes, sp_full, prev_full, node_key, n_static,
         TOTAL_BUD, AC_SPEED, TURN_PEN,
-        min_spacing=min_spacing, max_n=MAX_JOINT_N)
+        min_spacing=min_spacing, max_n=n_max_budget)
     t_search = time.time() - t0
     print(f'Search done [{t_search:.1f}s]')
 
