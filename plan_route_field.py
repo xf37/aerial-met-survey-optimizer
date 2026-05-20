@@ -414,12 +414,19 @@ def build_route_field(base, stops, T_sat_h,
 
 # ── Joint optimiser ───────────────────────────────────────────────────────────
 def find_best_route_field(base, chords, gatepoints_km, sat_cands,
+                          sat_arc_variants,
                           T_sat_h, full_nodes, sp_full, prev_full, node_key, n_static,
                           TOTAL_BUDGET_KM, AIRCRAFT_SPEED_KMH, TURN_PENALTY_KM,
                           min_spacing=MIN_LEG_SPACING_KM, max_n=MAX_JOINT_N):
-    """Max n_chords → max coincidence → min total dist.
+    """Max n_chords → max coincidence (no distance tiebreaker).
+
+    For every feasible minimum-arc route, the satellite arc is immediately extended
+    to the maximum feasible length (inline Method A).  Routes are ranked solely by:
+      1. n_chords  (descending)
+      2. max achievable coincidence  (descending)
     sat_cands: min-arc candidates after proximity filtering.
-    Returns (best_route, best_n, best_sat_entry_key).
+    sat_arc_variants: pa_key -> [(pb, arc_km), ...] sorted by increasing arc_km.
+    Returns (best_route, best_n, best_sat_entry_key, best_stop_list).
     """
     from itertools import permutations as _iperms
 
@@ -428,7 +435,7 @@ def find_best_route_field(base, chords, gatepoints_km, sat_cands,
                  'idx': node_key.get(tuple(np.round(gp, 3)))}
                 for gp in gatepoints_km]
 
-    best = None; best_n = 0; best_coinc = -1.0; best_total = 1e18
+    best = None; best_n = 0; best_coinc = -1.0
     best_sat_entry_key = None
     best_stop_list = None
 
@@ -446,6 +453,12 @@ def find_best_route_field(base, chords, gatepoints_km, sat_cands,
                            for c in combo]
 
             for pa, pb, arc_km in sat_cands:
+                pa_key = tuple(np.round(pa, 3))
+                # Prune: skip entry if its max arc can't beat current best
+                variants = sat_arc_variants.get(pa_key, [(pb, arc_km)])
+                if variants[-1][1] <= best_coinc + 1e-6:
+                    continue
+
                 sat_stop = {'type': 'sat', 'pt_a': pa, 'pt_b': pb, 'length': arc_km,
                             'idx_a': node_key.get(tuple(np.round(pa, 3))),
                             'idx_b': node_key.get(tuple(np.round(pb, 3)))}
@@ -485,16 +498,43 @@ def find_best_route_field(base, chords, gatepoints_km, sat_cands,
                         base, ordered, T_sat_h,
                         full_nodes, sp_full, prev_full, node_key, n_static,
                         TOTAL_BUDGET_KM, AIRCRAFT_SPEED_KMH, TURN_PENALTY_KM)
-                    if r and r['feasible']:
-                        coinc_b  = r['coinc_dist'] > best_coinc + 1e-6
-                        coinc_eq = abs(r['coinc_dist'] - best_coinc) <= 1e-6
-                        dist_b   = r['total_dist'] < best_total - 1e-6
-                        if coinc_b or (coinc_eq and dist_b):
-                            best_coinc = r['coinc_dist']
-                            best_total = r['total_dist']
-                            best = r; best_n = n; found = True
-                            best_sat_entry_key = tuple(np.round(pa, 3))
-                            best_stop_list = ordered
+                    if not (r and r['feasible']):
+                        continue
+
+                    # Inline Method A: extend satellite arc to maximum feasible length.
+                    sat_idx_in = next(i for i, s in enumerate(ordered) if s['type'] == 'sat')
+                    r_ext, arc_ext = r, r['coinc_dist']
+                    ext_stop_list = list(ordered)
+                    for pb_v, arc_v in variants:
+                        if arc_v <= arc_ext + 1e-6:
+                            continue
+                        pb_key = tuple(np.round(pb_v, 3))
+                        if pb_key not in node_key:
+                            continue
+                        new_stops = list(ordered)
+                        new_stops[sat_idx_in] = {
+                            'type': 'sat',
+                            'pt_a': ordered[sat_idx_in]['pt_a'],
+                            'pt_b': pb_v,
+                            'length': arc_v,
+                            'idx_a': ordered[sat_idx_in]['idx_a'],
+                            'idx_b': node_key[pb_key],
+                        }
+                        r2 = build_route_field(
+                            base, new_stops, T_sat_h,
+                            full_nodes, sp_full, prev_full, node_key, n_static,
+                            TOTAL_BUDGET_KM, AIRCRAFT_SPEED_KMH, TURN_PENALTY_KM)
+                        if r2 and r2['feasible']:
+                            r_ext, arc_ext = r2, arc_v
+                            ext_stop_list = new_stops
+                        else:
+                            break  # longer arcs also exceed budget
+
+                    if arc_ext > best_coinc + 1e-6:
+                        best_coinc = arc_ext
+                        best = r_ext; best_n = n; found = True
+                        best_sat_entry_key = pa_key
+                        best_stop_list = ext_stop_list
         if found:
             return best, best_n, best_sat_entry_key, best_stop_list
     return None, 0, None, None
@@ -648,7 +688,7 @@ def main():
     print(f'\nSearching (max_n={MAX_JOINT_N})...')
     t0 = time.time()
     best_r, best_n, sat_entry_key, best_stop_list = find_best_route_field(
-        BASE, chords, gatepoints_km, sat_filtered, T_SAT_H,
+        BASE, chords, gatepoints_km, sat_filtered, cache['sat_arc_variants'], T_SAT_H,
         full_nodes, sp_full, prev_full, node_key, n_static,
         TOTAL_BUD, AC_SPEED, TURN_PEN,
         min_spacing=min_spacing, max_n=MAX_JOINT_N)
@@ -659,23 +699,12 @@ def main():
         print('No feasible route found.')
         return
 
-    # ── Method A: extend satellite arc post-hoc ───────────────────────────────
-    # For each longer arc variant from the same entry, rebuild the full route so
-    # that the new exit transit distance and turn penalties are correctly computed.
-    arc_km_min = best_r['coinc_dist']
-    print(f'Method A: extending satellite arc from {arc_km_min:.0f} km...')
-    t0 = time.time()
-    best_r, arc_km_ext = extend_satellite_arc(
-        best_r, best_stop_list, cache['sat_arc_variants'],
-        sat_entry_key, T_SAT_H, BASE,
-        full_nodes, sp_full, prev_full, node_key, n_static,
-        TOTAL_BUD, AC_SPEED, TURN_PEN)
-    print(f'Method A done: {arc_km_min:.0f} -> {arc_km_ext:.0f} km  [{time.time()-t0:.1f}s]')
+    # Arc extension is done inline during search; best_r already has the maximum arc.
+    arc_km_ext = best_r['coinc_dist']
 
     # ── Results ───────────────────────────────────────────────────────────────
     t_total = time.time() - t_start
     coinc_min = arc_km_ext / AC_SPEED * 60.0
-    coinc_orig_min = arc_km_min / AC_SPEED * 60.0
     offset = best_r['T_dep_h'] - T_SAT_H
     sign   = '+' if offset >= 0 else ''
     drop_dist = route_dropsonde_dist(best_r['waypoints'], cache['dropsonde_union'])
@@ -687,9 +716,7 @@ def main():
     print(f'Total time: {t_total:.1f}s  (search {t_search:.1f}s)')
     print(f'n_chords        : {best_n}')
     print(f'TPV distance    : {best_r["tpv_dist"]:.0f} km')
-    print(f'Coincidence     : {arc_km_ext:.0f} km  ({coinc_min:.0f} min)'
-          + (f'  [extended from {arc_km_min:.0f} km ({coinc_orig_min:.0f} min)]'
-             if arc_km_ext > arc_km_min + 1e-3 else ''))
+    print(f'Coincidence     : {arc_km_ext:.0f} km  ({coinc_min:.0f} min)')
     print(f'Dropsonde       : {drop_dist:.0f} km  ({drop_min:.0f} min)')
     print(f'Total geo. dist : {best_r["geo_dist"]:.0f} km  '
           f'| flight time: {flight_h:.2f} h  ({flight_min:.0f} min)')
@@ -708,9 +735,7 @@ def main():
         f.write(f'Total time      : {t_total:.1f}s  (search {t_search:.1f}s)\n')
         f.write(f'n_chords        : {best_n}\n')
         f.write(f'TPV distance    : {best_r["tpv_dist"]:.0f} km\n')
-        ext_note = (f'  [extended from {arc_km_min:.0f} km ({coinc_orig_min:.0f} min)]'
-                    if arc_km_ext > arc_km_min + 1e-3 else '')
-        f.write(f'Coincidence     : {arc_km_ext:.0f} km  ({coinc_min:.0f} min){ext_note}\n')
+        f.write(f'Coincidence     : {arc_km_ext:.0f} km  ({coinc_min:.0f} min)\n')
         f.write(f'Dropsonde       : {drop_dist:.0f} km  ({drop_min:.0f} min)\n')
         f.write(f'Total geo. dist : {best_r["geo_dist"]:.0f} km\n')
         f.write(f'Flight time     : {flight_h:.2f} h  ({flight_min:.0f} min)\n')
