@@ -4,12 +4,15 @@ LOCK 1 (Master 2026-06-09): the planner MUST NOT surface infeasible plans.
 Anything failing this check is rejected before it can enter any Pareto
 archive or bundle.
 
-Phase A is *conservative* about routing through restricted airspace: if any
-straight-line segment crosses the restricted union the route is rejected
-outright.  We do not attempt to re-route around — that's Phase B's job (via
-the visibility-graph SP borrowed from 07).  As a consequence Phase A may
-reject some routes that could in principle be flown via a small detour;
-the trade-off buys us 5-minute envelope-scan latency.
+Phase A *does* re-route around restricted airspace at build time via
+:func:`multi_target_planner.visibility_graph.route_around_restricted`.  The
+per-segment crossing check below is therefore a defence-in-depth pass: it
+catches the corner cases where the visibility-graph router gave up
+(``BuiltRoute`` is ``None`` because an endpoint is boxed in) or where a
+returned polyline still clips a small restricted polygon (e.g. when
+``shapely.touches`` and ``shapely.intersects`` disagree on a numerical
+boundary).  If both routing and this check agree the segment is clear, the
+plan is accepted.
 """
 
 from __future__ import annotations
