@@ -1,0 +1,318 @@
+"""Polyline-builder + cost evaluator for the multi-target planner.
+
+A *route* is an ordered sequence of stops:
+
+    BASE -> [gatepoints in order] -> [TPV survey in order] -> BASE
+
+Each TPV survey consists of n parallel chords traversed boustrophedon-style:
+enter chord 1 at the endpoint closest to current position, exit at the far
+endpoint, fly to the closest endpoint of chord 2, etc.  The exit endpoint of
+chord n is also the exit of the TPV survey — the next transit begins there.
+
+Cost model (per the FPO-1 spec, codified by Reading B for turn penalty):
+
+    total_cost = geometric_distance
+               + sum(seg.length_inside_ATC * (ATC_FACTOR - 1))
+               + n_sharp_turns * TURN_PENALTY_KM * TURN_FACTOR
+
+where a "sharp" turn is one whose deviation from straight strictly exceeds
+``TURN_THRESHOLD_DEG`` (default 30°).
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+from dataclasses import dataclass
+from typing import Sequence
+
+import numpy as np
+from shapely.geometry import LineString
+
+# Borrowed 07 ops live at the repo root.
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+import plan_route_field as prf  # noqa: E402
+
+from multi_target_planner.turn_penalty import (
+    compute_turn_angles_deg,
+    turn_penalty_cost,
+)
+from multi_target_planner.chord_layout import ChordSet
+from multi_target_planner.visibility_graph import route_around_restricted
+
+
+# ---------------------------------------------------------------------------
+# Defaults — every value pulled from precompute_mission.py / 07 Cell 1
+# ---------------------------------------------------------------------------
+
+DEFAULT_BUDGET_KM = 4250.0
+DEFAULT_AIRCRAFT_SPEED_KMH = 850.0
+DEFAULT_TURN_PENALTY_KM = 7.5 / 60.0 * DEFAULT_AIRCRAFT_SPEED_KMH   # ≈ 106 km
+DEFAULT_TURN_THRESHOLD_DEG = 30.0
+DEFAULT_TURN_FACTOR = 1.2
+DEFAULT_ATC_FACTOR = 1.35
+
+
+@dataclass(frozen=True)
+class CostBreakdown:
+    geometric_km: float
+    atc_extra_km: float
+    turn_penalty_km: float
+    total_km: float
+    n_sharp_turns: int
+    n_total_turns: int
+
+
+@dataclass(frozen=True)
+class BuiltRoute:
+    polyline: np.ndarray         # (N, 2)
+    seg_kinds: tuple[str, ...]   # one per segment (N-1 of them): "transit" | "chord" | "spacer"
+    cost: CostBreakdown
+
+
+# ---------------------------------------------------------------------------
+# Polyline construction
+# ---------------------------------------------------------------------------
+
+def _chord_traversal(chord_set: ChordSet, pos: np.ndarray) -> tuple[list[np.ndarray], list[str]]:
+    """Walk a ChordSet boustrophedon-style from ``pos``.
+
+    Returns ``(stops, kinds)`` where ``stops`` are the waypoints *after* ``pos``
+    (entry, exit, next-entry, next-exit, ...) and ``kinds`` is the segment kind
+    leading into each stop.
+    """
+    stops: list[np.ndarray] = []
+    kinds: list[str] = []
+    cur = np.asarray(pos, dtype=np.float64)
+    for k, chord in enumerate(chord_set.chords):
+        pt_a = np.asarray(chord["pt_a"], dtype=np.float64)
+        pt_b = np.asarray(chord["pt_b"], dtype=np.float64)
+        d_a = float(np.linalg.norm(pt_a - cur))
+        d_b = float(np.linalg.norm(pt_b - cur))
+        if d_a <= d_b:
+            entry, exit_pt = pt_a, pt_b
+        else:
+            entry, exit_pt = pt_b, pt_a
+        # Transit (entry) — distinguishes the leg from the actual chord.
+        # The very first chord's entry is a transit from outside the TPV; the
+        # entries of subsequent chords are spacer hops within the TPV.
+        stops.append(entry)
+        kinds.append("transit" if k == 0 else "spacer")
+        stops.append(exit_pt)
+        kinds.append("chord")
+        cur = exit_pt
+    return stops, kinds
+
+
+@dataclass(frozen=True)
+class Stop:
+    """One leg of the route — either a TPV survey or a single gatepoint.
+
+    For ``kind == "tpv"``: ``payload`` is the :class:`ChordSet` and
+    ``tpv_index`` records which TPV (so the caller can map back to labels).
+    For ``kind == "gatepoint"``: ``payload`` is the (2,) coordinate and
+    ``tpv_index`` is -1.
+    """
+    kind: str
+    payload: object
+    tpv_index: int = -1
+
+
+def make_tpv_stop(tpv_index: int, chord_set: ChordSet) -> Stop:
+    return Stop(kind="tpv", payload=chord_set, tpv_index=tpv_index)
+
+
+def make_gatepoint_stop(coord_km: np.ndarray) -> Stop:
+    return Stop(kind="gatepoint", payload=np.asarray(coord_km, dtype=np.float64).reshape(2), tpv_index=-1)
+
+
+def _transit_polyline(
+    src: np.ndarray,
+    dst: np.ndarray,
+    restricted_union,
+) -> np.ndarray | None:
+    """Compute the actual transit polyline between two waypoints, routing
+    around any restricted polygon that would block the direct line.
+
+    Returns ``None`` if no route is reachable (a fully encircled point).
+    """
+    if restricted_union is None or restricted_union.is_empty:
+        return np.vstack([src, dst])
+    poly = route_around_restricted(src, dst, restricted_union)
+    return poly  # may be None when boxed in
+
+
+def build_route(
+    base: np.ndarray,
+    gatepoints_km: np.ndarray | None = None,
+    tpv_visit: Sequence[tuple[int, ChordSet]] | None = None,
+    *,
+    stops: Sequence[Stop] | None = None,
+    restricted_union=None,
+    atc_union=None,
+    turn_penalty_km: float = DEFAULT_TURN_PENALTY_KM,
+    turn_threshold_deg: float = DEFAULT_TURN_THRESHOLD_DEG,
+    turn_factor: float = DEFAULT_TURN_FACTOR,
+    atc_factor: float = DEFAULT_ATC_FACTOR,
+) -> BuiltRoute | None:
+    """Build a route as ``BASE -> stops in order -> BASE``.
+
+    Either pass an explicit ``stops`` list (preferred — allows gatepoints to
+    be interleaved with TPVs at arbitrary positions) or use the legacy
+    ``(gatepoints_km, tpv_visit)`` pair which forces ``BASE -> all gatepoints
+    -> all TPVs -> BASE`` and is kept for backwards compatibility with the
+    earlier smoke tests.
+    """
+    base = np.asarray(base, dtype=np.float64).reshape(2)
+
+    if stops is None:
+        # Legacy path: gatepoints first (in order), then TPVs (in tpv_visit order).
+        gp = (
+            np.asarray(gatepoints_km, dtype=np.float64).reshape(-1, 2)
+            if gatepoints_km is not None
+            else np.empty((0, 2), dtype=np.float64)
+        )
+        legacy_stops: list[Stop] = []
+        for g in gp:
+            legacy_stops.append(make_gatepoint_stop(g))
+        for tpv_idx, chord_set in (tpv_visit or ()):
+            legacy_stops.append(make_tpv_stop(tpv_idx, chord_set))
+        stops = legacy_stops
+
+    waypoints: list[np.ndarray] = [base]
+    kinds: list[str] = []
+    cur = base
+
+    def _add_transit_to(target: np.ndarray) -> bool:
+        nonlocal cur
+        poly = _transit_polyline(cur, target, restricted_union)
+        if poly is None:
+            return False
+        # poly[0] == cur (already in waypoints); append everything from poly[1:].
+        for k in range(1, poly.shape[0]):
+            waypoints.append(poly[k])
+            kinds.append("transit")
+        cur = waypoints[-1]
+        return True
+
+    for stop in stops:
+        if stop.kind == "gatepoint":
+            gp_xy = np.asarray(stop.payload, dtype=np.float64).reshape(2)
+            if not _add_transit_to(gp_xy):
+                return None
+        elif stop.kind == "tpv":
+            chord_set: ChordSet = stop.payload  # type: ignore[assignment]
+            # Pick the entry endpoint of the first chord closer to `cur`.
+            first = chord_set.chords[0]
+            entry_pt = np.asarray(first["pt_a"], dtype=np.float64)
+            other_pt = np.asarray(first["pt_b"], dtype=np.float64)
+            if np.linalg.norm(other_pt - cur) < np.linalg.norm(entry_pt - cur):
+                entry_pt, other_pt = other_pt, entry_pt
+            if not _add_transit_to(entry_pt):
+                return None
+            # Now we're at the first chord's entry; traverse the rest of the
+            # chord set boustrophedon-style (no obstacle routing needed inside
+            # the TPV — generate_candidate_chords already filtered chords that
+            # cross restricted airspace).
+            cur = entry_pt
+            # Append the exit of chord 1.
+            waypoints.append(other_pt)
+            kinds.append("chord")
+            cur = other_pt
+            for c in chord_set.chords[1:]:
+                pt_a = np.asarray(c["pt_a"], dtype=np.float64)
+                pt_b = np.asarray(c["pt_b"], dtype=np.float64)
+                d_a = float(np.linalg.norm(pt_a - cur))
+                d_b = float(np.linalg.norm(pt_b - cur))
+                if d_a <= d_b:
+                    nxt_entry, nxt_exit = pt_a, pt_b
+                else:
+                    nxt_entry, nxt_exit = pt_b, pt_a
+                # Inter-chord spacer (still inside the TPV; treated as straight).
+                waypoints.append(nxt_entry)
+                kinds.append("spacer")
+                waypoints.append(nxt_exit)
+                kinds.append("chord")
+                cur = nxt_exit
+        else:
+            raise ValueError(f"Unknown stop kind: {stop.kind!r}")
+
+    # Final return-to-base (may need to route around restricted on the way back).
+    if not _add_transit_to(base):
+        return None
+
+    polyline = np.vstack(waypoints)
+    cost = compute_route_cost(
+        polyline=polyline,
+        atc_union=atc_union,
+        turn_penalty_km=turn_penalty_km,
+        turn_threshold_deg=turn_threshold_deg,
+        turn_factor=turn_factor,
+        atc_factor=atc_factor,
+    )
+    return BuiltRoute(polyline=polyline, seg_kinds=tuple(kinds), cost=cost)
+
+
+# ---------------------------------------------------------------------------
+# Cost evaluator
+# ---------------------------------------------------------------------------
+
+def _segment_lengths_and_atc(polyline: np.ndarray, atc_union) -> tuple[np.ndarray, float]:
+    """Return (lengths, atc_extra_km).
+
+    ``lengths`` is the per-segment geometric distance.  ``atc_extra_km`` is the
+    total extra km charged by the ATC penalty (i.e. ``inside_len * (factor-1)``
+    accumulated across segments).
+    """
+    n_seg = polyline.shape[0] - 1
+    if n_seg <= 0:
+        return np.zeros((0,)), 0.0
+    diffs = polyline[1:] - polyline[:-1]
+    lengths = np.linalg.norm(diffs, axis=1)
+    atc_inside_total = 0.0
+    if atc_union is not None and not atc_union.is_empty:
+        for i in range(n_seg):
+            p1, p2 = polyline[i], polyline[i + 1]
+            if lengths[i] < 1e-9:
+                continue
+            seg = LineString([p1, p2])
+            inside = seg.intersection(atc_union)
+            if not inside.is_empty:
+                atc_inside_total += inside.length
+    return lengths, atc_inside_total
+
+
+def compute_route_cost(
+    polyline: np.ndarray,
+    *,
+    atc_union=None,
+    turn_penalty_km: float = DEFAULT_TURN_PENALTY_KM,
+    turn_threshold_deg: float = DEFAULT_TURN_THRESHOLD_DEG,
+    turn_factor: float = DEFAULT_TURN_FACTOR,
+    atc_factor: float = DEFAULT_ATC_FACTOR,
+) -> CostBreakdown:
+    """Compute :class:`CostBreakdown` for a polyline."""
+    polyline = np.asarray(polyline, dtype=np.float64)
+    lengths, atc_inside_total = _segment_lengths_and_atc(polyline, atc_union)
+    geometric_km = float(np.sum(lengths))
+    atc_extra_km = float(atc_inside_total) * (atc_factor - 1.0)
+
+    angles = compute_turn_angles_deg(polyline)
+    n_sharp = int(np.sum(angles > turn_threshold_deg))
+    n_total = int(angles.size)
+    turn_km = turn_penalty_cost(
+        angles, turn_penalty_km, turn_threshold_deg, turn_factor
+    )
+
+    total = geometric_km + atc_extra_km + turn_km
+    return CostBreakdown(
+        geometric_km=geometric_km,
+        atc_extra_km=atc_extra_km,
+        turn_penalty_km=turn_km,
+        total_km=total,
+        n_sharp_turns=n_sharp,
+        n_total_turns=n_total,
+    )

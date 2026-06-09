@@ -29,10 +29,46 @@ from multi_target_planner.data_loader import (
     load_gatepoints,
     base_km,
 )
+from multi_target_planner.chord_layout import (
+    ChordSet,
+    TpvGeometry,
+    enumerate_chord_sets,
+    fit_tpv_geometry,
+    precompute_all_chord_sets,
+)
+from multi_target_planner.route_builder import (
+    BuiltRoute,
+    CostBreakdown,
+    DEFAULT_ATC_FACTOR,
+    DEFAULT_BUDGET_KM,
+    DEFAULT_TURN_FACTOR,
+    DEFAULT_TURN_PENALTY_KM,
+    DEFAULT_TURN_THRESHOLD_DEG,
+    build_route,
+    compute_route_cost,
+)
+from multi_target_planner.feasibility import (
+    FeasibilityResult,
+    is_route_feasible,
+)
+from multi_target_planner.pareto import (
+    Bundle,
+    ParetoArchive,
+    Plan,
+    curate_bundles,
+    dominates,
+)
+from multi_target_planner.phase_a import (
+    EnvelopeResult,
+    format_envelope_summary,
+    phase_a_envelope,
+)
 
 __all__ = [
+    # turn penalty
     "compute_turn_angles_deg",
     "turn_penalty_cost",
+    # data loader
     "DEFAULT_DATA_DIR",
     "BASE_WGS84_LON",
     "BASE_WGS84_LAT",
@@ -48,4 +84,33 @@ __all__ = [
     "load_satellite_track",
     "load_gatepoints",
     "base_km",
+    # chord layout
+    "ChordSet",
+    "TpvGeometry",
+    "enumerate_chord_sets",
+    "fit_tpv_geometry",
+    "precompute_all_chord_sets",
+    # route builder
+    "BuiltRoute",
+    "CostBreakdown",
+    "DEFAULT_ATC_FACTOR",
+    "DEFAULT_BUDGET_KM",
+    "DEFAULT_TURN_FACTOR",
+    "DEFAULT_TURN_PENALTY_KM",
+    "DEFAULT_TURN_THRESHOLD_DEG",
+    "build_route",
+    "compute_route_cost",
+    # feasibility
+    "FeasibilityResult",
+    "is_route_feasible",
+    # pareto
+    "Bundle",
+    "ParetoArchive",
+    "Plan",
+    "curate_bundles",
+    "dominates",
+    # phase A
+    "EnvelopeResult",
+    "format_envelope_summary",
+    "phase_a_envelope",
 ]
