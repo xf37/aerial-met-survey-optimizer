@@ -106,23 +106,23 @@ def test_empty_angles_yields_zero_cost():
     ) == 0.0
 
 
-def test_threshold_strict_below_is_free():
-    # Reading B: 29° ≤ 30 → SMALL → FREE (0 km)
+def test_threshold_below_is_free():
+    # Reading B (inclusive >=): 29° < 30 → SMALL → FREE (0 km)
     cost = turn_penalty_cost(
         np.array([29.0]), DEFAULT_PENALTY_KM, DEFAULT_THRESHOLD_DEG, DEFAULT_FACTOR
     )
     assert cost == 0.0
 
 
-def test_threshold_strict_exact_is_free():
-    # Reading B: 30.0 == threshold → STRICT > → SMALL → FREE (0 km)
+def test_threshold_exact_is_sharp_after_inclusive_flip():
+    # Inclusive >= per Luc 2026-06-09 (Master's 30 度以上 reads inclusive in Chinese).
     cost = turn_penalty_cost(
         np.array([30.0]), DEFAULT_PENALTY_KM, DEFAULT_THRESHOLD_DEG, DEFAULT_FACTOR
     )
-    assert cost == 0.0
+    assert math.isclose(cost, DEFAULT_PENALTY_KM * DEFAULT_FACTOR, rel_tol=1e-12)
 
 
-def test_threshold_strict_above_applies_factor():
+def test_threshold_above_applies_factor():
     # 30.0001° → sharp → 1.2× penalty (127.2 km).
     cost = turn_penalty_cost(
         np.array([30.0001]), DEFAULT_PENALTY_KM, DEFAULT_THRESHOLD_DEG, DEFAULT_FACTOR
@@ -145,12 +145,13 @@ def test_180_degree_uturn_uses_factor():
 
 
 def test_mixed_angles_sum_correctly():
-    # 0°, 30° (exact, FREE), 31° (sharp), 90° (sharp), 180° (sharp) — three sharp, two small (free).
+    # Inclusive >=: 0°, 30° (exact, NOW sharp), 31° (sharp), 90° (sharp),
+    # 180° (sharp) — four sharp, one small (free).
     angles = np.array([0.0, 30.0, 31.0, 90.0, 180.0])
     cost = turn_penalty_cost(
         angles, DEFAULT_PENALTY_KM, DEFAULT_THRESHOLD_DEG, DEFAULT_FACTOR
     )
-    expected = 3 * DEFAULT_PENALTY_KM * DEFAULT_FACTOR  # only 3 sharp turns contribute
+    expected = 4 * DEFAULT_PENALTY_KM * DEFAULT_FACTOR
     assert math.isclose(cost, expected, rel_tol=1e-12)
 
 

@@ -64,17 +64,18 @@ def turn_penalty_cost(
 
     For each turn with deviation ``angle`` (degrees) the contribution is::
 
-        0.0                          if angle <= threshold_deg     (small turn, FREE)
-        turn_penalty_km * factor     if angle  > threshold_deg     (sharp turn)
+        0.0                          if angle  < threshold_deg     (small turn, FREE)
+        turn_penalty_km * factor     if angle >= threshold_deg     (sharp turn)
 
     Small turns are FREE — this matches the existing 07 / plan_route_field.py
-    idiom (`count_turns_in_path`: turns at or below the threshold contribute
+    idiom (`count_turns_in_path`: turns below the threshold contribute
     nothing). Master's 2026-06-09 directive layers the `factor` multiplier on
     top of the existing free-small-turn semantics so sharp turns now cost
     ``turn_penalty_km * factor`` instead of ``turn_penalty_km`` alone.
 
-    The threshold is a STRICT greater-than: ``angle == threshold_deg`` is
-    treated as a small turn. Flip to ``>=`` if the spec is later clarified.
+    The threshold is INCLUSIVE (``>=``): a turn exactly at ``threshold_deg``
+    is treated as sharp. This matches the inclusive Chinese reading of
+    Master's "30 度以上" (Luc planner ruling 2026-06-09).
 
     Parameters
     ----------
@@ -97,6 +98,6 @@ def turn_penalty_cost(
     angles = np.asarray(angles_deg, dtype=np.float64)
     if angles.size == 0:
         return 0.0
-    sharp = angles > threshold_deg
+    sharp = angles >= threshold_deg
     n_sharp = int(np.sum(sharp))
     return float(n_sharp) * turn_penalty_km * factor

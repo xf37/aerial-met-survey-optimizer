@@ -1,13 +1,24 @@
 """Polyline-builder + cost evaluator for the multi-target planner.
 
-A *route* is an ordered sequence of stops:
+A *route* is an ordered sequence of :class:`Stop` items, optionally with
+gatepoints interleaved at arbitrary positions:
 
-    BASE -> [gatepoints in order] -> [TPV survey in order] -> BASE
+    BASE -> [stops in caller-specified order] -> BASE
 
-Each TPV survey consists of n parallel chords traversed boustrophedon-style:
+Each TPV stop is a survey of n parallel chords traversed boustrophedon-style:
 enter chord 1 at the endpoint closest to current position, exit at the far
 endpoint, fly to the closest endpoint of chord 2, etc.  The exit endpoint of
 chord n is also the exit of the TPV survey — the next transit begins there.
+
+**Transit routing around restricted airspace.**  Every transit segment
+(BASE -> first stop, stop -> stop, last stop -> BASE) is routed via
+:func:`multi_target_planner.visibility_graph.route_around_restricted`, which
+returns the shortest poly-line that detours around any restricted polygon
+that would otherwise be crossed.  Detour vertices appear as additional
+points on the route polyline with kind ``"transit"``.  Inside a TPV survey
+we trust the chord-generation filter to have already dropped any chord that
+crosses restricted airspace, so chord and spacer segments are kept as direct
+lines.
 
 Cost model (per the FPO-1 spec, codified by Reading B for turn penalty):
 
@@ -15,8 +26,9 @@ Cost model (per the FPO-1 spec, codified by Reading B for turn penalty):
                + sum(seg.length_inside_ATC * (ATC_FACTOR - 1))
                + n_sharp_turns * TURN_PENALTY_KM * TURN_FACTOR
 
-where a "sharp" turn is one whose deviation from straight strictly exceeds
-``TURN_THRESHOLD_DEG`` (default 30°).
+where a "sharp" turn is one whose deviation from straight is **>=**
+``TURN_THRESHOLD_DEG`` (default 30°), matching the inclusive Chinese reading
+"30 度以上" Master picked on 2026-06-09.
 """
 
 from __future__ import annotations
@@ -76,36 +88,6 @@ class BuiltRoute:
 # ---------------------------------------------------------------------------
 # Polyline construction
 # ---------------------------------------------------------------------------
-
-def _chord_traversal(chord_set: ChordSet, pos: np.ndarray) -> tuple[list[np.ndarray], list[str]]:
-    """Walk a ChordSet boustrophedon-style from ``pos``.
-
-    Returns ``(stops, kinds)`` where ``stops`` are the waypoints *after* ``pos``
-    (entry, exit, next-entry, next-exit, ...) and ``kinds`` is the segment kind
-    leading into each stop.
-    """
-    stops: list[np.ndarray] = []
-    kinds: list[str] = []
-    cur = np.asarray(pos, dtype=np.float64)
-    for k, chord in enumerate(chord_set.chords):
-        pt_a = np.asarray(chord["pt_a"], dtype=np.float64)
-        pt_b = np.asarray(chord["pt_b"], dtype=np.float64)
-        d_a = float(np.linalg.norm(pt_a - cur))
-        d_b = float(np.linalg.norm(pt_b - cur))
-        if d_a <= d_b:
-            entry, exit_pt = pt_a, pt_b
-        else:
-            entry, exit_pt = pt_b, pt_a
-        # Transit (entry) — distinguishes the leg from the actual chord.
-        # The very first chord's entry is a transit from outside the TPV; the
-        # entries of subsequent chords are spacer hops within the TPV.
-        stops.append(entry)
-        kinds.append("transit" if k == 0 else "spacer")
-        stops.append(exit_pt)
-        kinds.append("chord")
-        cur = exit_pt
-    return stops, kinds
-
 
 @dataclass(frozen=True)
 class Stop:

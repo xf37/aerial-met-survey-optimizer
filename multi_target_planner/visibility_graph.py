@@ -55,8 +55,22 @@ _route_cache: dict[tuple, np.ndarray | None] = {}
 
 
 def clear_route_cache() -> None:
-    """Drop the memoization cache (call when the restricted union changes)."""
+    """Drop the memoization cache (only useful for tests; ordinary callers
+    don't need this because the cache key now includes the restricted-union
+    geometry hash — different unions can't collide)."""
     _route_cache.clear()
+
+
+def _restricted_signature(restricted_union) -> str:
+    """Stable signature for ``restricted_union`` used in the cache key.
+
+    Uses Shapely's WKT representation, which is deterministic for a given
+    geometry and changes the moment any vertex moves.  Empty / None unions
+    map to a single fixed signature so they share a cache.
+    """
+    if restricted_union is None or restricted_union.is_empty:
+        return "__empty__"
+    return restricted_union.wkt
 
 
 def route_around_restricted(
@@ -82,12 +96,15 @@ def route_around_restricted(
         return np.vstack([p1, p2])
 
     # Memoize on endpoint coords (rounded to 0.01 km so floating-point noise
-    # doesn't generate spurious cache misses). The cache is keyed by the
-    # canonical (smaller-first) order so direction-flipped queries hit too.
+    # doesn't generate spurious cache misses) AND the restricted-union
+    # signature so changing the union invalidates entries automatically.
+    # The endpoint pair is stored in canonical (smaller-first) order so
+    # direction-flipped queries hit too.
     a = (round(float(p1[0]), 2), round(float(p1[1]), 2))
     b = (round(float(p2[0]), 2), round(float(p2[1]), 2))
     flipped = b < a
-    key = (b, a) if flipped else (a, b)
+    sig = _restricted_signature(restricted_union)
+    key = (sig, b, a) if flipped else (sig, a, b)
     cached = _route_cache.get(key)
     if cached is not None:
         return cached if not flipped else cached[::-1]
