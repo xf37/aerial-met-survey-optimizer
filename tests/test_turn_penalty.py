@@ -106,24 +106,24 @@ def test_empty_angles_yields_zero_cost():
     ) == 0.0
 
 
-def test_threshold_strict_below_uses_unit_multiplier():
-    # 29° → not over 30 → 1.0× penalty
+def test_threshold_strict_below_is_free():
+    # Reading B: 29° ≤ 30 → SMALL → FREE (0 km)
     cost = turn_penalty_cost(
         np.array([29.0]), DEFAULT_PENALTY_KM, DEFAULT_THRESHOLD_DEG, DEFAULT_FACTOR
     )
-    assert math.isclose(cost, DEFAULT_PENALTY_KM, rel_tol=1e-12)
+    assert cost == 0.0
 
 
-def test_threshold_strict_exact_uses_unit_multiplier():
-    # 30.0 == threshold → STRICT > → still 1.0×.
+def test_threshold_strict_exact_is_free():
+    # Reading B: 30.0 == threshold → STRICT > → SMALL → FREE (0 km)
     cost = turn_penalty_cost(
         np.array([30.0]), DEFAULT_PENALTY_KM, DEFAULT_THRESHOLD_DEG, DEFAULT_FACTOR
     )
-    assert math.isclose(cost, DEFAULT_PENALTY_KM, rel_tol=1e-12)
+    assert cost == 0.0
 
 
 def test_threshold_strict_above_applies_factor():
-    # 30.0001° → sharp → 1.2× penalty.
+    # 30.0001° → sharp → 1.2× penalty (127.2 km).
     cost = turn_penalty_cost(
         np.array([30.0001]), DEFAULT_PENALTY_KM, DEFAULT_THRESHOLD_DEG, DEFAULT_FACTOR
     )
@@ -145,26 +145,33 @@ def test_180_degree_uturn_uses_factor():
 
 
 def test_mixed_angles_sum_correctly():
-    # 0°, 30° (exact, NOT sharp), 31° (sharp), 90° (sharp), 180° (sharp) — three sharp + two small.
+    # 0°, 30° (exact, FREE), 31° (sharp), 90° (sharp), 180° (sharp) — three sharp, two small (free).
     angles = np.array([0.0, 30.0, 31.0, 90.0, 180.0])
     cost = turn_penalty_cost(
         angles, DEFAULT_PENALTY_KM, DEFAULT_THRESHOLD_DEG, DEFAULT_FACTOR
     )
-    expected = DEFAULT_PENALTY_KM * (2 * 1.0 + 3 * DEFAULT_FACTOR)
+    expected = 3 * DEFAULT_PENALTY_KM * DEFAULT_FACTOR  # only 3 sharp turns contribute
     assert math.isclose(cost, expected, rel_tol=1e-12)
 
 
-def test_default_magnitude_for_typical_plan():
-    # rough sanity check: an Atypical 5-chord TPV plan ~ 7 small + 0 sharp turns
-    # using the placeholder old model would cost (5+2) × 106 × 1.2 = 890.4 km.
-    # under the new angle-gated model with ALL turns < 30°, cost is (5+2) × 106 × 1.0 = 742 km.
-    # this test pins the "all-small" expectation so future regressions don't silently
-    # reintroduce the placeholder 1.2× margin everywhere.
+def test_all_small_turns_yield_zero_cost():
+    # Reading B: a plan with ONLY sub-threshold turns costs nothing.
+    # This was the 07-idiom behaviour; we preserve it.
     small_angles = np.full(7, 20.0)
     cost = turn_penalty_cost(
         small_angles, DEFAULT_PENALTY_KM, DEFAULT_THRESHOLD_DEG, DEFAULT_FACTOR
     )
-    assert math.isclose(cost, 7 * DEFAULT_PENALTY_KM, rel_tol=1e-12)
+    assert cost == 0.0
+
+
+def test_only_sharp_turns_count():
+    # 10 turns total, 4 sharp → cost = 4 × 106 × 1.2 = 508.8 km
+    angles = np.array([5, 10, 31, 45, 25, 90, 20, 180, 28, 31], dtype=float)
+    cost = turn_penalty_cost(
+        angles, DEFAULT_PENALTY_KM, DEFAULT_THRESHOLD_DEG, DEFAULT_FACTOR
+    )
+    expected = 5 * DEFAULT_PENALTY_KM * DEFAULT_FACTOR  # 31, 45, 90, 180, 31 are sharp
+    assert math.isclose(cost, expected, rel_tol=1e-12)
 
 
 # ---------------------------------------------------------------------------
@@ -190,3 +197,24 @@ def test_end_to_end_polyline_to_cost():
         angles, DEFAULT_PENALTY_KM, DEFAULT_THRESHOLD_DEG, DEFAULT_FACTOR
     )
     assert math.isclose(cost, 3 * DEFAULT_PENALTY_KM * DEFAULT_FACTOR, rel_tol=1e-12)
+
+
+def test_end_to_end_zigzag_only_small_turns_is_free():
+    # A gentle zigzag where every turn is < 30° — under Reading B this is free.
+    a = math.radians(15.0)
+    pts = np.array(
+        [
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [1.0 + math.cos(a),  math.sin(a)],
+            [2.0 + math.cos(a),  math.sin(a) - math.sin(a)],  # back toward x-axis
+            [3.0 + math.cos(a),  math.sin(a) - math.sin(a)],  # straight on
+        ]
+    )
+    angles = compute_turn_angles_deg(pts)
+    # All angles ≤ 30° → all small → free.
+    assert all(angle <= 30.0 + 1e-9 for angle in angles)
+    cost = turn_penalty_cost(
+        angles, DEFAULT_PENALTY_KM, DEFAULT_THRESHOLD_DEG, DEFAULT_FACTOR
+    )
+    assert cost == 0.0

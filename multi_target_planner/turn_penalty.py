@@ -60,38 +60,43 @@ def turn_penalty_cost(
     threshold_deg: float,
     factor: float,
 ) -> float:
-    """Sum of per-turn penalty costs in km.
+    """Sum of per-turn penalty costs in km (Reading B per Master 2026-06-09).
 
     For each turn with deviation ``angle`` (degrees) the contribution is::
 
-        turn_penalty_km * (factor if angle > threshold_deg else 1.0)
+        0.0                          if angle <= threshold_deg     (small turn, FREE)
+        turn_penalty_km * factor     if angle  > threshold_deg     (sharp turn)
 
-    Note the threshold is a STRICT greater-than: a turn exactly equal to
-    ``threshold_deg`` is treated as a small turn (multiplier 1.0). This matches
-    Master's wording on 2026-06-09 ("方向变化 30 度以上"). Flip to ``>=`` if
-    the spec is later clarified to include the boundary.
+    Small turns are FREE — this matches the existing 07 / plan_route_field.py
+    idiom (`count_turns_in_path`: turns at or below the threshold contribute
+    nothing). Master's 2026-06-09 directive layers the `factor` multiplier on
+    top of the existing free-small-turn semantics so sharp turns now cost
+    ``turn_penalty_km * factor`` instead of ``turn_penalty_km`` alone.
+
+    The threshold is a STRICT greater-than: ``angle == threshold_deg`` is
+    treated as a small turn. Flip to ``>=`` if the spec is later clarified.
 
     Parameters
     ----------
     angles_deg : np.ndarray
         Output of :func:`compute_turn_angles_deg`.
     turn_penalty_km : float
-        Base penalty added per turn, in km. Defaults to ≈106 km (7.5 min × 850 km/h)
-        in upstream callers; kept as a parameter here so the unit module stays
-        independent of mission-cache values.
+        Base penalty added per sharp turn, in km. Defaults to ≈106 km
+        (7.5 min × 850 km/h) in upstream callers.
     threshold_deg : float
-        Strict greater-than threshold for applying ``factor``.
+        Strict greater-than threshold separating small (free) from sharp turns.
     factor : float
         Multiplier applied to ``turn_penalty_km`` for sharp turns.
 
     Returns
     -------
     float
-        Total turn-penalty cost in km. Returns 0.0 for an empty input.
+        Total turn-penalty cost in km. Returns 0.0 for an empty input or for a
+        path with only small turns.
     """
     angles = np.asarray(angles_deg, dtype=np.float64)
     if angles.size == 0:
         return 0.0
     sharp = angles > threshold_deg
-    multipliers = np.where(sharp, factor, 1.0)
-    return float(np.sum(multipliers) * turn_penalty_km)
+    n_sharp = int(np.sum(sharp))
+    return float(n_sharp) * turn_penalty_km * factor
