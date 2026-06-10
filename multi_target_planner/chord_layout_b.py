@@ -162,6 +162,10 @@ def build_chord_at(
     if result is None:
         return None
     pt_a, pt_b, length = result
+    # 10 km minimum chord length is inherited from Phase A's
+    # tpv_chord_cost_profile (chord_layout.py, originally Cell 4:L161 of the
+    # 07 lineage). Anything shorter is treated as numerical noise from the
+    # polygon edge, not a real survey chord.
     if length < 10.0:
         return None
     crosses = False
