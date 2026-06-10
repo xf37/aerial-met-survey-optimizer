@@ -236,21 +236,33 @@ def repair_insert_chord_any(
     s_step_km: float = DEFAULT_S_STEP_KM,
     theta_step_deg: float = DEFAULT_THETA_STEP_DEG,
     theta_max_deg: float = DEFAULT_THETA_MAX_DEG,
+    candidate_cache: dict | None = None,
 ) -> ALNSState:
-    """Fallback insert that searches the full (theta, s) grid."""
+    """Fallback insert that searches the full (theta, s) grid.
+
+    ``candidate_cache`` is keyed by ``tpv_index`` and stores the precomputed
+    candidate list to avoid rebuilding the (theta, s) grid every iteration
+    (which dominates the wall-clock when iterating non-trivially).
+    """
     candidates = list(state.chords_per_tpv.items())
     rng.shuffle(candidates)
     for pos, chord_list in candidates:
         tpv_index = tpv_index_by_position[pos]
-        poly = tpv_polys[tpv_index]
-        geom = tpv_geoms[tpv_index]
-        all_candidates = list(iter_candidate_chords(
-            tpv_index, poly, geom,
-            theta_step_deg=theta_step_deg, theta_max_deg=theta_max_deg,
-            s_step_km=s_step_km, restricted_union=restricted_union,
-        ))
-        rng.shuffle(all_candidates)
-        for rec in all_candidates:
+        if candidate_cache is not None and tpv_index in candidate_cache:
+            all_candidates = candidate_cache[tpv_index]
+        else:
+            poly = tpv_polys[tpv_index]
+            geom = tpv_geoms[tpv_index]
+            all_candidates = list(iter_candidate_chords(
+                tpv_index, poly, geom,
+                theta_step_deg=theta_step_deg, theta_max_deg=theta_max_deg,
+                s_step_km=s_step_km, restricted_union=restricted_union,
+            ))
+            if candidate_cache is not None:
+                candidate_cache[tpv_index] = all_candidates
+        shuffled = list(all_candidates)
+        rng.shuffle(shuffled)
+        for rec in shuffled:
             candidate = chord_list + [rec]
             ok, _ = chord_set_pairwise_feasible(candidate, min_spacing_km=min_spacing_km)
             if not ok:
@@ -289,6 +301,8 @@ def refine_plan_alns(
     max_iterations: int = 5000,
     rng: random.Random | None = None,
     incumbent_callback: Callable[[int, ALNSState], None] | None = None,
+    feasibility_check: Callable[[ALNSState], bool] | None = None,
+    candidate_cache: dict | None = None,
 ) -> ALNSResult:
     """Run ALNS until ``time_budget_sec`` or ``max_iterations`` is exhausted.
 
@@ -296,6 +310,8 @@ def refine_plan_alns(
     accepted move; the initial state must itself be feasible.
     """
     rng = rng or random.Random(0)
+    if candidate_cache is None:
+        candidate_cache = {}
     incumbent = initial_state.clone()
     incumbent_score = state_score(incumbent, theta_penalty_km_per_30deg=theta_penalty_km_per_30deg)
     history: list[tuple[int, float]] = [(0, incumbent_score)]
@@ -350,6 +366,7 @@ def refine_plan_alns(
                 tpv_polys=tpv_polys, tpv_geoms=tpv_geoms,
                 restricted_union=restricted_union,
                 min_spacing_km=min_spacing_km, rng=rng,
+                candidate_cache=candidate_cache,
             )
 
         candidate_score = state_score(candidate, theta_penalty_km_per_30deg=theta_penalty_km_per_30deg)
@@ -366,7 +383,12 @@ def refine_plan_alns(
             current = candidate
             current_score = candidate_score
             n_accepted += 1
-            if candidate_score > incumbent_score:
+            # Only promote to incumbent if the candidate is real-route feasible.
+            # This guards LOCK 1: no surfaced plan exceeds the flight budget.
+            is_feasible = True
+            if feasibility_check is not None:
+                is_feasible = feasibility_check(candidate)
+            if candidate_score > incumbent_score and is_feasible:
                 incumbent = candidate.clone()
                 incumbent_score = candidate_score
                 history.append((k + 1, incumbent_score))

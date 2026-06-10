@@ -154,7 +154,7 @@ def _render_before_after(out_path, plan, refinement, *, tpvs, base, gatepoints,
         f"n_tpvs={n_tpvs_ref}  total_chords={n_chords_ref}  "
         f"max_chord={max_chord_ref}\n"
         f"cost={refinement.refined_cost_km:.0f}/{BUDGET_KM:.0f} km   "
-        f"(Δ chords {refinement.chord_delta:+d}, Δ cost {refinement.cost_delta_km:+.0f} km)\n"
+        f"(delta chords {refinement.chord_delta:+d}, delta cost {refinement.cost_delta_km:+.0f} km)\n"
         f"{refined_visit}",
         fontsize=10,
     )
@@ -249,6 +249,7 @@ def main():
             base_km=base, gatepoints_km=gatepoints,
             restricted_union=restricted_union, atc_union=atc_union,
             turn_penalty_km=TURN_PENALTY_KM,
+            budget_km=BUDGET_KM,
             min_spacing_km=100.0,
             time_budget_sec=TIME_BUDGET_SEC,
             max_iterations=MAX_ITERATIONS,
@@ -256,8 +257,8 @@ def main():
         )
         dt = time.time() - t0
         print(f"  ALNS finished in {dt:.1f} s. "
-              f"Δ chords = {refinement.chord_delta:+d}, "
-              f"Δ cost = {refinement.cost_delta_km:+.0f} km")
+              f"d_chords = {refinement.chord_delta:+d}, "
+              f"d_cost = {refinement.cost_delta_km:+.0f} km")
         out_path = f"11_phase_b_plan_{plan_idx:02d}_before_after.png"
         _render_before_after(
             out_path, plan, refinement,

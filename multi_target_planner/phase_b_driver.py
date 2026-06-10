@@ -187,6 +187,7 @@ def refine_phase_a_plan(
     restricted_union=None,
     atc_union=None,
     turn_penalty_km: float,
+    budget_km: float = 10860.0,
     min_spacing_km: float = 100.0,
     time_budget_sec: float = 60.0,
     max_iterations: int = 5000,
@@ -219,6 +220,22 @@ def refine_phase_a_plan(
         baseline_route.cost.total_km if baseline_route is not None else float("inf")
     )
 
+    # Feasibility check: real-route cost must stay under the budget so LOCK 1
+    # holds at incumbent promotion. The materialise call is expensive (~50-
+    # 200 ms), so we only invoke it when an accepted move actually beats the
+    # current incumbent score — which is rare relative to iteration count.
+    def _is_budget_feasible(candidate_state):
+        rt = materialise_route(
+            candidate_state,
+            base_km=base_km, gatepoints_km=gatepoints_km,
+            restricted_union=restricted_union, atc_union=atc_union,
+            turn_penalty_km=turn_penalty_km,
+            min_spacing_km=min_spacing_km,
+        )
+        if rt is None:
+            return False
+        return rt.cost.total_km <= budget_km + 1e-6
+
     alns_result = refine_plan_alns(
         state,
         tpv_index_by_position=tpv_index_by_position,
@@ -229,6 +246,7 @@ def refine_phase_a_plan(
         max_iterations=max_iterations,
         rng=random.Random(rng_seed),
         incumbent_callback=incumbent_callback,
+        feasibility_check=_is_budget_feasible,
     )
 
     refined_route = materialise_route(
