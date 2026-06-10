@@ -57,6 +57,17 @@ from multi_target_planner.pareto import (
     Plan,
     curate_bundles,
 )
+from multi_target_planner.sat_arc import (
+    DEFAULT_AIRCRAFT_SPEED_KMH as SAT_DEFAULT_AIRCRAFT_SPEED_KMH,
+    DEFAULT_ENTRY_STEP_KM,
+    DEFAULT_SAT_ARC_MAX_KM,
+    DEFAULT_SAT_ARC_STEP_KM,
+    DEFAULT_SAT_MIN_LENGTH_KM,
+    DEFAULT_T_SAT_H,
+    SatArcCandidate,
+    check_sat_feasibility,
+    enumerate_sat_arc_candidates,
+)
 from multi_target_planner.route_builder import (
     DEFAULT_AIRCRAFT_SPEED_KMH,
     DEFAULT_ATC_FACTOR,
@@ -107,13 +118,16 @@ class EnvelopeResult:
     bundle_b2: Bundle                            # max-single-TPV-chord bundle
     archive_size: int
     n_enumerated: int
-    n_feasible: int
+    n_feasible: int                              # feasibility ignoring sat constraint
+    n_feasible_with_sat: int                     # feasibility AFTER sat hard constraint (v2 metric)
+    n_sat_rejected: int                          # plans dropped at sat hard constraint
     elapsed_sec: float
     geoms: tuple[TpvGeometry, ...]
+    sat_constraint_enforced: bool                # True for v2 runs, False for v1
 
     @property
     def has_any_feasible(self) -> bool:
-        return self.n_feasible > 0
+        return self.n_feasible_with_sat > 0
 
 
 def phase_a_envelope(
@@ -123,6 +137,14 @@ def phase_a_envelope(
     *,
     restricted_union=None,
     atc_union=None,
+    sat_track_xy: np.ndarray | None = None,
+    enforce_sat_constraint: bool = False,
+    t_sat_h: float = DEFAULT_T_SAT_H,
+    aircraft_speed_kmh: float = SAT_DEFAULT_AIRCRAFT_SPEED_KMH,
+    sat_min_length_km: float = DEFAULT_SAT_MIN_LENGTH_KM,
+    sat_arc_max_km: float = DEFAULT_SAT_ARC_MAX_KM,
+    sat_arc_step_km: float = DEFAULT_SAT_ARC_STEP_KM,
+    sat_entry_step_km: float = DEFAULT_ENTRY_STEP_KM,
     n_chord_options: Sequence[int] = (1, 2, 3, 4),
     angle_devs_deg: Sequence[float] = (-5.0, 0.0, 5.0),
     min_spacing_km: float = 100.0,
@@ -149,10 +171,22 @@ def phase_a_envelope(
         min_spacing_km=min_spacing_km,
     )
 
+    sat_candidates: list[SatArcCandidate] = []
+    if enforce_sat_constraint and sat_track_xy is not None and sat_track_xy.shape[0] >= 2:
+        sat_candidates = enumerate_sat_arc_candidates(
+            sat_track_xy,
+            entry_step_km=sat_entry_step_km,
+            arc_step_km=sat_arc_step_km,
+            sat_min_length_km=sat_min_length_km,
+            sat_arc_max_km=sat_arc_max_km,
+        )
+
     archive = ParetoArchive()
     chord_max_per_tpv = [0] * n
     n_enumerated = 0
     n_feasible = 0
+    n_feasible_with_sat = 0
+    n_sat_rejected = 0
 
     gp_arr = (
         np.asarray(gatepoints_km, dtype=np.float64).reshape(-1, 2)
@@ -193,13 +227,28 @@ def phase_a_envelope(
                         )
                         if not feasibility.ok:
                             continue
+                        n_feasible += 1
+                        # S2-min sat hard constraint check (Phase A.v2 only).
+                        if enforce_sat_constraint:
+                            sat = check_sat_feasibility(
+                                route,
+                                base_km,
+                                sat_candidates,
+                                budget_km=budget_km,
+                                aircraft_speed_kmh=aircraft_speed_kmh,
+                                t_sat_h=t_sat_h,
+                                sat_min_length_km=sat_min_length_km,
+                            )
+                            if not sat.feasible:
+                                n_sat_rejected += 1
+                                continue
                         plan = Plan(
                             tpv_indices=tuple(order),
                             chord_choices=tuple(chord_combo),
                             route=route,
                         )
                         archive.offer(plan)
-                        n_feasible += 1
+                        n_feasible_with_sat += 1
                         for tpv_i, cs in zip(order, chord_combo):
                             if cs.n_chords > chord_max_per_tpv[tpv_i]:
                                 chord_max_per_tpv[tpv_i] = cs.n_chords
@@ -216,8 +265,11 @@ def phase_a_envelope(
         archive_size=len(archive),
         n_enumerated=n_enumerated,
         n_feasible=n_feasible,
+        n_feasible_with_sat=n_feasible_with_sat,
+        n_sat_rejected=n_sat_rejected,
         elapsed_sec=time.time() - t0,
         geoms=tuple(geoms),
+        sat_constraint_enforced=enforce_sat_constraint,
     )
 
 
@@ -226,13 +278,16 @@ def phase_a_envelope(
 # ---------------------------------------------------------------------------
 
 def format_envelope_summary(result: EnvelopeResult, tpv_labels: Sequence[str]) -> str:
+    v_tag = "v2 (sat enforced)" if result.sat_constraint_enforced else "v1 (no sat constraint)"
     lines = [
         "=" * 72,
-        f"Phase A envelope scan  ({result.elapsed_sec:.2f} s)",
+        f"Phase A envelope scan  [{v_tag}]  ({result.elapsed_sec:.2f} s)",
         "=" * 72,
-        f"Enumerated combinations : {result.n_enumerated:,}",
-        f"Feasible plans          : {result.n_feasible:,}",
-        f"Pareto archive size     : {result.archive_size}",
+        f"Enumerated combinations    : {result.n_enumerated:,}",
+        f"Feasible (geom + budget)   : {result.n_feasible:,}",
+        f"Sat-rejected               : {result.n_sat_rejected:,}",
+        f"Feasible AFTER sat (final) : {result.n_feasible_with_sat:,}",
+        f"Pareto archive size        : {result.archive_size}",
         "",
         f"n_max_tpvs (most TPVs in one feasible flight) : {result.n_max_tpvs}",
         "chord_max_per_tpv:",
