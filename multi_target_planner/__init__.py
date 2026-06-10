@@ -80,6 +80,13 @@ from multi_target_planner.verifier import (
     verify_bundle,
     verify_plan,
 )
+from multi_target_planner.io import (
+    SCHEMA_VERSION,
+    PhaseARun,
+    build_run,
+    load_phase_a_run,
+    save_phase_a_run,
+)
 
 __all__ = [
     # turn penalty
@@ -145,4 +152,10 @@ __all__ = [
     "VerifierReport",
     "verify_bundle",
     "verify_plan",
+    # io (PB-0)
+    "SCHEMA_VERSION",
+    "PhaseARun",
+    "build_run",
+    "load_phase_a_run",
+    "save_phase_a_run",
 ]
