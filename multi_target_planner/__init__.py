@@ -80,6 +80,22 @@ from multi_target_planner.verifier import (
     verify_bundle,
     verify_plan,
 )
+from multi_target_planner.chord_layout_b import (
+    DEFAULT_S_STEP_KM,
+    DEFAULT_THETA_MAX_DEG,
+    DEFAULT_THETA_STEP_DEG,
+    NonParallelChordRecord,
+    NonParallelChordSet,
+    build_chord_at,
+    chord_set_pairwise_feasible,
+    chords_cross_inside_polygon,
+    enumerate_chord_sets_b,
+    iter_candidate_chords,
+    major_axis_spacing,
+    s_grid_km,
+    survey_distance,
+    theta_grid_deg,
+)
 
 __all__ = [
     # turn penalty
@@ -145,4 +161,19 @@ __all__ = [
     "VerifierReport",
     "verify_bundle",
     "verify_plan",
+    # PB-1 non-parallel chord layout
+    "DEFAULT_S_STEP_KM",
+    "DEFAULT_THETA_MAX_DEG",
+    "DEFAULT_THETA_STEP_DEG",
+    "NonParallelChordRecord",
+    "NonParallelChordSet",
+    "build_chord_at",
+    "chord_set_pairwise_feasible",
+    "chords_cross_inside_polygon",
+    "enumerate_chord_sets_b",
+    "iter_candidate_chords",
+    "major_axis_spacing",
+    "s_grid_km",
+    "survey_distance",
+    "theta_grid_deg",
 ]
