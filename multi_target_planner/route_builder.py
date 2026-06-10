@@ -76,12 +76,16 @@ class CostBreakdown:
     total_km: float
     n_sharp_turns: int
     n_total_turns: int
+    coinc_dist_km: float = 0.0          # total km flown along a satellite track
+    t_dep_h: float | None = None        # departure time = T_sat - d(BASE->sat_mid)/v
+    sat_entry_km: tuple[float, float] | None = None
+    sat_exit_km: tuple[float, float] | None = None
 
 
 @dataclass(frozen=True)
 class BuiltRoute:
     polyline: np.ndarray         # (N, 2)
-    seg_kinds: tuple[str, ...]   # one per segment (N-1 of them): "transit" | "chord" | "spacer"
+    seg_kinds: tuple[str, ...]   # one per segment (N-1 of them): "transit" | "chord" | "spacer" | "sat"
     cost: CostBreakdown
 
 
@@ -109,6 +113,28 @@ def make_tpv_stop(tpv_index: int, chord_set: ChordSet) -> Stop:
 
 def make_gatepoint_stop(coord_km: np.ndarray) -> Stop:
     return Stop(kind="gatepoint", payload=np.asarray(coord_km, dtype=np.float64).reshape(2), tpv_index=-1)
+
+
+@dataclass(frozen=True)
+class SatStopPayload:
+    """Payload for a SatStop: enter at ``pt_a``, fly arc forward to ``pt_b``."""
+    pt_a: np.ndarray       # entry point (km)
+    pt_b: np.ndarray       # exit point (km)
+    arc_km: float          # geometric length of the satellite arc (km)
+    track_waypoints: np.ndarray  # (N, 2) intermediate points along the sat track
+
+
+def make_sat_stop(pt_a, pt_b, arc_km: float, track_waypoints) -> Stop:
+    """Build a Stop carrying a SatStopPayload. The aircraft flies pt_a -> pt_b
+    along the satellite ground track (track_waypoints are the intermediate
+    vertices along the cropped sat track between pt_a and pt_b)."""
+    payload = SatStopPayload(
+        pt_a=np.asarray(pt_a, dtype=np.float64).reshape(2),
+        pt_b=np.asarray(pt_b, dtype=np.float64).reshape(2),
+        arc_km=float(arc_km),
+        track_waypoints=np.asarray(track_waypoints, dtype=np.float64).reshape(-1, 2),
+    )
+    return Stop(kind="sat", payload=payload, tpv_index=-1)
 
 
 def _transit_polyline(
@@ -139,6 +165,8 @@ def build_route(
     turn_threshold_deg: float = DEFAULT_TURN_THRESHOLD_DEG,
     turn_factor: float = DEFAULT_TURN_FACTOR,
     atc_factor: float = DEFAULT_ATC_FACTOR,
+    t_sat_h: float | None = None,
+    aircraft_speed_kmh: float = DEFAULT_AIRCRAFT_SPEED_KMH,
 ) -> BuiltRoute | None:
     """Build a route as ``BASE -> stops in order -> BASE``.
 
@@ -168,8 +196,15 @@ def build_route(
     kinds: list[str] = []
     cur = base
 
+    # Tracking for sat arc midpoint -> T_dep computation.
+    geo_dist_so_far = 0.0
+    geo_to_sat_mid: float | None = None
+    coinc_dist_km = 0.0
+    sat_entry_xy: tuple[float, float] | None = None
+    sat_exit_xy: tuple[float, float] | None = None
+
     def _add_transit_to(target: np.ndarray) -> bool:
-        nonlocal cur
+        nonlocal cur, geo_dist_so_far
         poly = _transit_polyline(cur, target, restricted_union)
         if poly is None:
             return False
@@ -177,6 +212,7 @@ def build_route(
         for k in range(1, poly.shape[0]):
             waypoints.append(poly[k])
             kinds.append("transit")
+            geo_dist_so_far += float(np.linalg.norm(poly[k] - poly[k - 1]))
         cur = waypoints[-1]
         return True
 
@@ -203,6 +239,7 @@ def build_route(
             # Append the exit of chord 1.
             waypoints.append(other_pt)
             kinds.append("chord")
+            geo_dist_so_far += float(np.linalg.norm(other_pt - cur))
             cur = other_pt
             for c in chord_set.chords[1:]:
                 pt_a = np.asarray(c["pt_a"], dtype=np.float64)
@@ -216,9 +253,41 @@ def build_route(
                 # Inter-chord spacer (still inside the TPV; treated as straight).
                 waypoints.append(nxt_entry)
                 kinds.append("spacer")
+                geo_dist_so_far += float(np.linalg.norm(nxt_entry - cur))
                 waypoints.append(nxt_exit)
                 kinds.append("chord")
+                geo_dist_so_far += float(np.linalg.norm(nxt_exit - nxt_entry))
                 cur = nxt_exit
+        elif stop.kind == "sat":
+            sat: SatStopPayload = stop.payload  # type: ignore[assignment]
+            # 1. Transit cur -> sat entry (pt_a).
+            if not _add_transit_to(sat.pt_a):
+                return None
+            # 2. Fly the cropped satellite track from pt_a to pt_b. The track
+            #    waypoints already include pt_a as the first vertex; skip it.
+            track = sat.track_waypoints
+            if track.shape[0] < 2 or np.linalg.norm(track[0] - sat.pt_a) > 1e-6:
+                # Defensive fallback: straight pt_a -> pt_b.
+                track = np.vstack([sat.pt_a, sat.pt_b])
+            # Distance up to sat midpoint for T_dep:
+            arc_so_far = 0.0
+            for k in range(1, track.shape[0]):
+                seg_len = float(np.linalg.norm(track[k] - track[k - 1]))
+                if (geo_to_sat_mid is None
+                        and arc_so_far + seg_len >= sat.arc_km / 2.0):
+                    frac = (sat.arc_km / 2.0 - arc_so_far) / max(seg_len, 1e-9)
+                    geo_to_sat_mid = geo_dist_so_far + frac * seg_len
+                arc_so_far += seg_len
+                waypoints.append(track[k])
+                kinds.append("sat")
+                geo_dist_so_far += seg_len
+            if geo_to_sat_mid is None:
+                # Whole arc fit in last segment without crossing midpoint trigger
+                geo_to_sat_mid = geo_dist_so_far - sat.arc_km / 2.0
+            coinc_dist_km += sat.arc_km
+            sat_entry_xy = (float(sat.pt_a[0]), float(sat.pt_a[1]))
+            sat_exit_xy = (float(sat.pt_b[0]), float(sat.pt_b[1]))
+            cur = waypoints[-1]
         else:
             raise ValueError(f"Unknown stop kind: {stop.kind!r}")
 
@@ -234,6 +303,23 @@ def build_route(
         turn_threshold_deg=turn_threshold_deg,
         turn_factor=turn_factor,
         atc_factor=atc_factor,
+    )
+    # T_dep = T_sat - d(BASE -> sat midpoint) / v.  Negative T_dep means the
+    # aircraft would have had to leave before T=0 (infeasible).
+    t_dep_h = None
+    if t_sat_h is not None and geo_to_sat_mid is not None:
+        t_dep_h = float(t_sat_h) - float(geo_to_sat_mid) / float(aircraft_speed_kmh)
+    cost = CostBreakdown(
+        geometric_km=cost.geometric_km,
+        atc_extra_km=cost.atc_extra_km,
+        turn_penalty_km=cost.turn_penalty_km,
+        total_km=cost.total_km,
+        n_sharp_turns=cost.n_sharp_turns,
+        n_total_turns=cost.n_total_turns,
+        coinc_dist_km=float(coinc_dist_km),
+        t_dep_h=t_dep_h,
+        sat_entry_km=sat_entry_xy,
+        sat_exit_km=sat_exit_xy,
     )
     return BuiltRoute(polyline=polyline, seg_kinds=tuple(kinds), cost=cost)
 

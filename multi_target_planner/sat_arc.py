@@ -45,6 +45,8 @@ class SatArcCandidate:
     exit_xy: np.ndarray     # (2,)
     arc_km: float
     mid_xy: np.ndarray      # (2,)
+    entry_s_km: float = 0.0  # arc-length offset of entry along the track
+    exit_s_km: float = 0.0   # arc-length offset of exit along the track
 
 
 def _cum_arc_length(track_xy: np.ndarray) -> np.ndarray:
@@ -62,6 +64,34 @@ def _interp_track(track_xy: np.ndarray, cum: np.ndarray, s: float) -> np.ndarray
     span = cum[i + 1] - cum[i]
     t = 0.0 if span < 1e-9 else (s - cum[i]) / span
     return track_xy[i] + t * (track_xy[i + 1] - track_xy[i])
+
+
+def slice_track_between(
+    track_xy: np.ndarray,
+    cum: np.ndarray,
+    s0: float,
+    s1: float,
+) -> np.ndarray:
+    """Return the polyline of the satellite ground track between arc-lengths
+    ``s0`` and ``s1`` (inclusive of both endpoints), preserving every
+    intermediate track vertex between them.  Used by :func:`build_route` to
+    fly the actual curved track shape instead of a straight chord.
+    """
+    if s0 > s1:
+        s0, s1 = s1, s0
+    pts: list[np.ndarray] = [_interp_track(track_xy, cum, s0)]
+    i0 = int(np.searchsorted(cum, s0, side="right"))
+    i1 = int(np.searchsorted(cum, s1, side="left"))
+    for k in range(i0, i1 + 1):
+        if k < len(track_xy):
+            pts.append(track_xy[k])
+    pts.append(_interp_track(track_xy, cum, s1))
+    # Drop duplicate consecutive points (entry/first-vertex collision etc).
+    cleaned: list[np.ndarray] = [pts[0]]
+    for p in pts[1:]:
+        if np.linalg.norm(p - cleaned[-1]) > 1e-6:
+            cleaned.append(p)
+    return np.asarray(cleaned, dtype=np.float64)
 
 
 def enumerate_sat_arc_candidates(
@@ -97,6 +127,8 @@ def enumerate_sat_arc_candidates(
                     exit_xy=exit_pt,
                     arc_km=float(arc),
                     mid_xy=mid,
+                    entry_s_km=float(entry_s),
+                    exit_s_km=float(exit_s),
                 )
             )
     return candidates

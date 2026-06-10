@@ -28,6 +28,12 @@ from multi_target_planner import (
     phase_a_envelope,
 )
 from multi_target_planner.phase_b_driver import refine_phase_a_plan
+from multi_target_planner.sat_arc import (
+    enumerate_sat_arc_candidates,
+)
+
+
+T_SAT_H = 4.0  # satellite passes reference point at T = 4 h after departure
 
 
 # 777 / 12 h mission profile (matches notebook defaults).
@@ -40,11 +46,34 @@ SAT_MIN_LENGTH_KM = 6.0 / 60.0 * AIRCRAFT_SPEED_KMH
 SAT_ARC_MAX_KM = 30.0 / 60.0 * AIRCRAFT_SPEED_KMH
 
 # Master's requested plans (1-based indexing in the sorted-by-subset archive view).
-PLAN_INDICES = [15, 18]
+# Plan #1 added per PB-3: budget-loose single-TPV case shows Phase B value
+# (non-parallel chord around restricted + sat arc embedded).
+PLAN_INDICES = [1, 15, 18]
 
 # Budget per refinement.
 TIME_BUDGET_SEC = 180.0
 MAX_ITERATIONS = 4000
+
+
+def _sat_title_line(route) -> str:
+    """One-line summary of the satellite arc embedded in ``route``."""
+    if route is None or route.cost.sat_entry_km is None:
+        return "sat: NOT EMBEDDED"
+    ex, ey = route.cost.sat_entry_km
+    xx, xy = route.cost.sat_exit_km
+    coinc_km = route.cost.coinc_dist_km
+    coinc_min = coinc_km / AIRCRAFT_SPEED_KMH * 60.0
+    t_dep = route.cost.t_dep_h
+    if t_dep is None:
+        t_dep_str = "n/a"
+    else:
+        offset = t_dep - T_SAT_H
+        sign = "+" if offset >= 0 else ""
+        t_dep_str = f"T_sat{sign}{offset:.2f}h"
+    return (
+        f"sat IN=({ex:.0f},{ey:.0f}) km  OUT=({xx:.0f},{xy:.0f}) km  "
+        f"coinc={coinc_km:.0f} km ({coinc_min:.0f} min)  T_dep={t_dep_str}"
+    )
 
 
 def _draw_base_layers(ax, *, tpvs, base, gatepoints, restricted, atc, dropsonde, satellite):
@@ -73,7 +102,8 @@ def _draw_base_layers(ax, *, tpvs, base, gatepoints, restricted, atc, dropsonde,
     ax.plot(base[0], base[1], marker="*", color="black", ms=14, zorder=9)
 
 
-def _plot_route(ax, route, *, colour, lw_chord=2.4, lw_spacer=1.6, lw_transit=1.0, ls_transit="--"):
+def _plot_route(ax, route, *, colour, lw_chord=2.4, lw_spacer=1.6, lw_transit=1.0,
+                ls_transit="--", sat_colour="#8800bb"):
     if route is None:
         ax.text(0.5, 0.5, "no feasible route", transform=ax.transAxes,
                 ha="center", va="center", fontsize=12, color="#888888")
@@ -88,9 +118,30 @@ def _plot_route(ax, route, *, colour, lw_chord=2.4, lw_spacer=1.6, lw_transit=1.
         elif kind == "spacer":
             ax.plot([p1[0], p2[0]], [p1[1], p2[1]], "-",
                     color=colour, lw=lw_spacer, alpha=0.85, zorder=8)
+        elif kind == "sat":
+            ax.plot([p1[0], p2[0]], [p1[1], p2[1]], "-",
+                    color=sat_colour, lw=2.8, alpha=0.95, zorder=9)
         else:
             ax.plot([p1[0], p2[0]], [p1[1], p2[1]], ls_transit,
                     color=colour, lw=lw_transit, alpha=0.75, zorder=7.5)
+    # Annotate sat entry / exit if present.
+    if route.cost.sat_entry_km is not None and route.cost.sat_exit_km is not None:
+        ex, ey = route.cost.sat_entry_km
+        xx, xy = route.cost.sat_exit_km
+        ax.plot(ex, ey, marker="o", color=sat_colour, ms=8,
+                markerfacecolor="white", markeredgewidth=2.0, zorder=10)
+        ax.plot(xx, xy, marker="s", color=sat_colour, ms=8,
+                markerfacecolor="white", markeredgewidth=2.0, zorder=10)
+        ax.annotate(
+            f"sat IN\n({ex:.0f}, {ey:.0f}) km",
+            (ex, ey), textcoords="offset points", xytext=(8, 8),
+            color=sat_colour, fontsize=7, fontweight="bold", zorder=11,
+        )
+        ax.annotate(
+            f"sat OUT\n({xx:.0f}, {xy:.0f}) km",
+            (xx, xy), textcoords="offset points", xytext=(8, -16),
+            color=sat_colour, fontsize=7, fontweight="bold", zorder=11,
+        )
 
 
 def _viewport(tpvs, base, gatepoints, pad=500.0):
@@ -128,13 +179,15 @@ def _render_before_after(out_path, plan, refinement, *, tpvs, base, gatepoints,
     _plot_route(ax, refinement.baseline_route, colour="#444444")
     ax.set_xlim(xmin, xmax); ax.set_ylim(ymin, ymax); ax.set_aspect("equal")
     ax.grid(True, alpha=0.25)
+    base_sat = _sat_title_line(refinement.baseline_route)
     ax.set_title(
         f"Plan #{plan_idx}  BEFORE (Phase A baseline)\n"
         f"n_tpvs={plan.n_tpvs}  total_chords={plan.total_chords}  "
         f"max_chord={plan.max_chord_single_tpv}\n"
         f"cost={refinement.baseline_cost_km:.0f}/{BUDGET_KM:.0f} km\n"
+        f"{base_sat}\n"
         f"{initial_visit}",
-        fontsize=10,
+        fontsize=9,
     )
 
     # Refined
@@ -149,21 +202,28 @@ def _render_before_after(out_path, plan, refinement, *, tpvs, base, gatepoints,
     n_chords_ref = state.total_chords()
     max_chord_ref = state.max_chord_single_tpv()
     n_tpvs_ref = sum(1 for v in state.chords_per_tpv.values() if v)
+    ref_sat = _sat_title_line(refinement.refined_route)
     ax.set_title(
         f"Plan #{plan_idx}  AFTER (Phase B refined)\n"
         f"n_tpvs={n_tpvs_ref}  total_chords={n_chords_ref}  "
         f"max_chord={max_chord_ref}\n"
         f"cost={refinement.refined_cost_km:.0f}/{BUDGET_KM:.0f} km   "
         f"(delta chords {refinement.chord_delta:+d}, delta cost {refinement.cost_delta_km:+.0f} km)\n"
+        f"{ref_sat}\n"
         f"{refined_visit}",
-        fontsize=10,
+        fontsize=9,
     )
 
     legend_handles = [
         Line2D([0], [0], color="#444444", lw=2.4, label="Phase A baseline chord"),
         Line2D([0], [0], color="#d62728", lw=2.4, label="Phase B refined chord"),
         Line2D([0], [0], color="#444444", lw=1.0, ls="--", label="Transit (routed around restricted)"),
-        Line2D([0], [0], color="#8800bb", lw=1.0, ls="--", alpha=0.55, label="Satellite track"),
+        Line2D([0], [0], color="#8800bb", lw=2.8, label="Sat coincidence (flown along track)"),
+        Line2D([0], [0], color="#8800bb", lw=1.0, ls="--", alpha=0.55, label="Satellite track (full)"),
+        Line2D([0], [0], marker="o", color="#8800bb", ms=8, markerfacecolor="white",
+               markeredgewidth=2.0, ls="none", label="Sat entry (pt_a)"),
+        Line2D([0], [0], marker="s", color="#8800bb", ms=8, markerfacecolor="white",
+               markeredgewidth=2.0, ls="none", label="Sat exit (pt_b)"),
         Line2D([0], [0], marker="*", color="black", ms=10, ls="none", label="BASE"),
         Line2D([0], [0], marker="D", color="#ff7f0e", ms=7, ls="none", label="Gatepoint"),
         Patch(facecolor="#ff6666", alpha=0.40, label="Restricted airspace"),
@@ -235,6 +295,16 @@ def main():
 
     print(f"[Phase B demo] {len(plans_in_order)} unique plans surfaced.")
 
+    # PB-3: enumerate sat candidates ONCE so each plan can pick the best
+    # (entry, exit, arc_km) at insertion time.
+    sat_candidates = enumerate_sat_arc_candidates(
+        sat_track_xy=satellite,
+        sat_min_length_km=SAT_MIN_LENGTH_KM,
+        sat_arc_max_km=SAT_ARC_MAX_KM,
+    )
+    print(f"[Phase B demo] {len(sat_candidates)} sat (entry, arc) candidates "
+          f"enumerated along satellite track")
+
     for plan_idx in PLAN_INDICES:
         if plan_idx > len(plans_in_order):
             print(f"[Phase B demo] plan #{plan_idx} not in archive, skipping.")
@@ -254,11 +324,21 @@ def main():
             time_budget_sec=TIME_BUDGET_SEC,
             max_iterations=MAX_ITERATIONS,
             rng_seed=plan_idx,
+            sat_candidates=sat_candidates,
+            sat_track_xy=satellite,
+            t_sat_h=T_SAT_H,
+            aircraft_speed_kmh=AIRCRAFT_SPEED_KMH,
         )
         dt = time.time() - t0
+        ref_coinc = (refinement.refined_route.cost.coinc_dist_km
+                     if refinement.refined_route is not None else 0.0)
+        ref_tdep = (refinement.refined_route.cost.t_dep_h
+                    if refinement.refined_route is not None else None)
         print(f"  ALNS finished in {dt:.1f} s. "
               f"d_chords = {refinement.chord_delta:+d}, "
-              f"d_cost = {refinement.cost_delta_km:+.0f} km")
+              f"d_cost = {refinement.cost_delta_km:+.0f} km, "
+              f"sat_coinc = {ref_coinc:.0f} km, "
+              f"T_dep = {ref_tdep if ref_tdep is None else f'{ref_tdep:.2f}h'}")
         out_path = f"11_phase_b_plan_{plan_idx:02d}_before_after.png"
         _render_before_after(
             out_path, plan, refinement,
