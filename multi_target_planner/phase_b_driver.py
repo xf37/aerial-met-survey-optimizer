@@ -242,7 +242,7 @@ def embed_best_sat_arc(
     aircraft_speed_kmh: float = DEFAULT_AIRCRAFT_SPEED_KMH,
     t_sat_h: float = DEFAULT_T_SAT_H,
     min_spacing_km: float = 100.0,
-    max_candidates_to_try: int = 60,
+    max_candidates_to_try: int = 200,
 ) -> tuple[BuiltRoute | None, SatArcCandidate | None, int | None]:
     """Try inserting each sat candidate at each viable position; return the
     best feasible route along with the chosen candidate and insertion index.
@@ -255,9 +255,14 @@ def embed_best_sat_arc(
     if n_tpv_stops == 0:
         return None, None, None
 
-    # Order candidates by descending arc so we exit early once a longer
-    # candidate has been confirmed feasible at every position.
-    ordered = sorted(sat_candidates, key=lambda c: -c.arc_km)[:max_candidates_to_try]
+    # Order: longest arc first; within the same arc-bucket, midpoints closest
+    # to BASE first (best T_dep margin).  This guarantees we test the most
+    # promising long-arc candidates before falling back to shorter ones.
+    base_arr = np.asarray(base_km).reshape(2)
+    ordered = sorted(
+        sat_candidates,
+        key=lambda c: (-c.arc_km, float(np.linalg.norm(c.mid_xy - base_arr))),
+    )[:max_candidates_to_try]
 
     best_route: BuiltRoute | None = None
     best_cand: SatArcCandidate | None = None
