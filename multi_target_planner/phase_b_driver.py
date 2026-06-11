@@ -21,6 +21,7 @@ from multi_target_planner.alns import (
     ALNSState,
     refine_plan_alns,
 )
+from multi_target_planner.phase_a import _interleave_with_gatepoints
 from multi_target_planner.chord_layout import (
     ChordSet,
     TpvGeometry,
@@ -128,20 +129,19 @@ def _records_to_chord_set(
     )
 
 
-def _build_stops_from_state(
+def _ordered_stops_from_state(
     state: ALNSState,
     *,
-    gatepoints_km: np.ndarray,
     min_spacing_km: float,
     sat_stop: Stop | None = None,
     sat_position: int | None = None,
 ) -> list[Stop]:
-    """Build a Phase-A-style stop list from an ALNSState.  If ``sat_stop`` is
-    provided, insert it at ``sat_position`` (0 = right after the last
-    gatepoint, before the first TPV; len(TPVs) = after every TPV)."""
-    stops: list[Stop] = []
-    for gp in np.asarray(gatepoints_km).reshape(-1, 2):
-        stops.append(make_gatepoint_stop(gp))
+    """Build the *ordered* (TPV + optional sat) stop list from an ALNSState.
+
+    Gatepoints are NOT included here — the caller is responsible for
+    interleaving them via :func:`_interleave_with_gatepoints` so the
+    optimal placement is searched, not forced to the head.
+    """
     tpv_stops: list[Stop] = []
     for position, tpv_idx in enumerate(state.visit_order):
         records = state.chords_per_tpv.get(position, [])
@@ -154,7 +154,7 @@ def _build_stops_from_state(
     if sat_stop is not None and sat_position is not None:
         sp = max(0, min(len(tpv_stops), sat_position))
         tpv_stops.insert(sp, sat_stop)
-    return stops + tpv_stops
+    return tpv_stops
 
 
 def materialise_route(
@@ -173,38 +173,55 @@ def materialise_route(
     sat_position: int | None = None,
     t_sat_h: float | None = None,
     aircraft_speed_kmh: float = DEFAULT_AIRCRAFT_SPEED_KMH,
+    dropsonde_union=None,
 ) -> BuiltRoute | None:
     """Build the actual flight polyline for an ALNS state via Phase A's
     :func:`build_route`.
 
-    Gatepoints are placed at the head of the stop sequence (same order
-    they came in).  PB-2 v1 freezes Phase A's gatepoint placement; PB-5
-    will release it.
+    Gatepoint placement is found via Phase A's
+    :func:`_interleave_with_gatepoints` enumeration (m! * C(k+m, m) layouts
+    for k TPVs and m gatepoints — 20 layouts at k=3, m=2).  The cheapest
+    feasible layout wins.  Master 2026-06-10: putting gatepoints at the
+    head was a bug — the optimal route for case 15 puts them between TPV-2
+    and TPV-3 so transit segments don't waste-cross TPV-1.
 
     If ``sat_stop`` + ``sat_position`` are provided, the sat arc is
-    inserted into the stop list at ``sat_position`` (0 = before the first
-    TPV).  ``t_sat_h`` is forwarded to :func:`build_route` so the returned
+    inserted into the TPV-ordered stop list at ``sat_position`` BEFORE
+    the gatepoints are interleaved (so sat keeps its TPV-relative slot).
+    ``t_sat_h`` is forwarded to :func:`build_route` so the returned
     BuiltRoute carries the computed ``t_dep_h`` field.
     """
-    stops = _build_stops_from_state(
+    tpv_and_sat_stops = _ordered_stops_from_state(
         state,
-        gatepoints_km=gatepoints_km,
         min_spacing_km=min_spacing_km,
         sat_stop=sat_stop,
         sat_position=sat_position,
     )
-    return build_route(
-        base=base_km,
-        stops=stops,
-        restricted_union=restricted_union,
-        atc_union=atc_union,
-        turn_penalty_km=turn_penalty_km,
-        turn_threshold_deg=turn_threshold_deg,
-        turn_factor=turn_factor,
-        atc_factor=atc_factor,
-        t_sat_h=t_sat_h,
-        aircraft_speed_kmh=aircraft_speed_kmh,
-    )
+    gp_stops = [
+        make_gatepoint_stop(g)
+        for g in np.asarray(gatepoints_km).reshape(-1, 2)
+    ]
+
+    best: BuiltRoute | None = None
+    for ordered_stops in _interleave_with_gatepoints(tpv_and_sat_stops, gp_stops):
+        route = build_route(
+            base=base_km,
+            stops=ordered_stops,
+            restricted_union=restricted_union,
+            atc_union=atc_union,
+            turn_penalty_km=turn_penalty_km,
+            turn_threshold_deg=turn_threshold_deg,
+            turn_factor=turn_factor,
+            atc_factor=atc_factor,
+            t_sat_h=t_sat_h,
+            aircraft_speed_kmh=aircraft_speed_kmh,
+            dropsonde_union=dropsonde_union,
+        )
+        if route is None:
+            continue
+        if best is None or route.cost.total_km < best.cost.total_km - 1e-6:
+            best = route
+    return best
 
 
 # ---------------------------------------------------------------------------
@@ -225,6 +242,51 @@ class PhaseBRefinement:
     refined_sat_position: int | None = None
     baseline_sat_candidate: SatArcCandidate | None = None
     baseline_sat_position: int | None = None
+    infeasible_real_sat_insert: bool = False
+    infeasibility_reason: str = ""
+
+
+# Master 2026-06-11 / Luc analysis: satellite has a *physical* direction
+# (EarthCARE 2016-05-16 overpass is north→south along the cropped track).
+# The aircraft must enter the sat segment with its heading aligned with
+# the sat direction — opposite-heading entry is unphysical (the relative
+# velocity is 2× orbital, not a coincidence).  Use cos(angle) >= 0.5
+# (within 60°) as the alignment threshold.
+DEFAULT_SAT_DIR_COS_THRESHOLD = 0.5
+
+
+def _check_sat_direction_alignment(
+    route: BuiltRoute,
+    cos_threshold: float = DEFAULT_SAT_DIR_COS_THRESHOLD,
+) -> bool:
+    """True iff the aircraft's heading approaching the satellite entry is
+    aligned with the satellite ground-track direction at that point.
+
+    The polyline carries the materialised stop-by-stop waypoints; we look
+    for the FIRST 'sat'-kind segment, take the heading at the waypoint
+    before it (aircraft approach) and the heading of the sat segment
+    itself, and check the cosine of the angle between them.  Angles > 60°
+    (cos < 0.5) are rejected.
+    """
+    poly = route.polyline
+    kinds = route.seg_kinds
+    sat_seg_idx: int | None = None
+    for k, kind in enumerate(kinds):
+        if kind == "sat":
+            sat_seg_idx = k
+            break
+    if sat_seg_idx is None or sat_seg_idx == 0:
+        return False
+    # Approach: waypoint[sat_seg_idx] is sat entry pt_a; the prior segment
+    # ends at sat_seg_idx and started at sat_seg_idx-1.
+    approach = poly[sat_seg_idx] - poly[sat_seg_idx - 1]
+    sat_dir = poly[sat_seg_idx + 1] - poly[sat_seg_idx]
+    a_norm = float(np.linalg.norm(approach))
+    s_norm = float(np.linalg.norm(sat_dir))
+    if a_norm < 1e-9 or s_norm < 1e-9:
+        return False
+    cos_angle = float(np.dot(approach, sat_dir) / (a_norm * s_norm))
+    return cos_angle >= cos_threshold
 
 
 def embed_best_sat_arc(
@@ -300,6 +362,11 @@ def embed_best_sat_arc(
                 continue
             if route.cost.t_dep_h is None or route.cost.t_dep_h < 0.0:
                 continue
+            # Sat direction check: aircraft approach heading must align with
+            # satellite ground-track direction (cos(angle) >= 0.5, within 60°)
+            # — opposite-heading entry is unphysical.
+            if not _check_sat_direction_alignment(route):
+                continue
             better = (
                 best_route is None
                 or route.cost.coinc_dist_km > best_route.cost.coinc_dist_km + 1e-6
@@ -338,13 +405,28 @@ def refine_phase_a_plan(
     sat_track_xy: np.ndarray | None = None,
     t_sat_h: float = DEFAULT_T_SAT_H,
     aircraft_speed_kmh: float = DEFAULT_AIRCRAFT_SPEED_KMH,
+    parallel_only: bool = False,
+    freeze_chord_count: bool = False,
+    dropsonde_union=None,
+    w_chord_len: float = 1.0,
+    w_coinc: float = 2.0,
+    w_dropsonde: float = 0.5,
+    runtime_warn_sec: float = 30 * 60,
 ) -> PhaseBRefinement:
     """Refine one Phase A plan with ALNS and materialise the result.
 
     Returns a :class:`PhaseBRefinement` carrying both the baseline (the
     Phase A plan rebuilt with the same machinery so the comparison is
     apples-to-apples) and the refined route.
+
+    A runtime warning is emitted to stderr if wall-clock time exceeds
+    ``runtime_warn_sec`` (default 30 min) — Master 2026-06-11: "如果
+    Phase B 运行超过 30 分钟，就要报告" — this is defense in depth alongside
+    whatever the calling script does.
     """
+    import sys as _sys
+    import time as _time
+    _t_start = _time.time()
     state = phase_a_plan_to_alns_state(plan)
     tpv_index_by_position = {
         position: tpv_idx for position, tpv_idx in enumerate(state.visit_order)
@@ -354,16 +436,12 @@ def refine_phase_a_plan(
         i: fit_tpv_geometry(t.label, t.vertices_km) for i, t in enumerate(tpvs)
     }
 
-    baseline_route = materialise_route(
-        state,
-        base_km=base_km, gatepoints_km=gatepoints_km,
-        restricted_union=restricted_union, atc_union=atc_union,
-        turn_penalty_km=turn_penalty_km,
-        min_spacing_km=min_spacing_km,
-    )
-    baseline_cost = (
-        baseline_route.cost.total_km if baseline_route is not None else float("inf")
-    )
+    # Baseline = Phase A's *actual* optimal route.  Using plan.route
+    # directly preserves Phase A's optimal gatepoint placement (vs my
+    # earlier shortcut that always put gatepoints at the head and inflated
+    # cost by ~1000 km on case 15).
+    baseline_route = plan.route
+    baseline_cost = baseline_route.cost.total_km
 
     # Feasibility check: real-route cost must stay under the budget so LOCK 1
     # holds at incumbent promotion. The materialise call is expensive (~50-
@@ -376,10 +454,71 @@ def refine_phase_a_plan(
             restricted_union=restricted_union, atc_union=atc_union,
             turn_penalty_km=turn_penalty_km,
             min_spacing_km=min_spacing_km,
+            dropsonde_union=dropsonde_union,
         )
         if rt is None:
             return False
         return rt.cost.total_km <= budget_km + 1e-6
+
+    # Score = -real total cost (lower cost ⇒ higher score, ALNS maximizes).
+    # Master 2026-06-11: "想的把模型改正确" — surrogate must align with the
+    # real objective (min total flight km), not a proxy like chord length sum.
+    # Returns -infinity for infeasible (unroutable) states so ALNS rejects.
+    score_cache: dict = {}
+    sat_cum_arc_local = (
+        _cum_arc_length(sat_track_xy) if sat_track_xy is not None else None
+    )
+
+    def _spec_objective_score(candidate_state):
+        sig = (
+            tuple(candidate_state.visit_order),
+            tuple(
+                tuple((round(c.s_km, 3), round(c.theta_deg, 3))
+                      for c in sorted(candidate_state.chords_per_tpv.get(p, []),
+                                      key=lambda c: c.s_km))
+                for p in range(len(candidate_state.visit_order))
+            ),
+        )
+        if sig in score_cache:
+            return score_cache[sig]
+        # Try to embed the best sat arc into THIS candidate state, so the
+        # score reflects what Phase B actually delivers (coinc_dist is the
+        # main objective ≥ chord length — without embedding, ALNS pushes
+        # chords until sat headroom is gone, regressing case 15).
+        embedded_route = None
+        if sat_candidates and sat_track_xy is not None and sat_cum_arc_local is not None:
+            embedded_route, _, _ = embed_best_sat_arc(
+                candidate_state,
+                sat_candidates=sat_candidates,
+                sat_track_xy=sat_track_xy, sat_cum_arc=sat_cum_arc_local,
+                base_km=base_km, gatepoints_km=gatepoints_km,
+                restricted_union=restricted_union, atc_union=atc_union,
+                turn_penalty_km=turn_penalty_km,
+                budget_km=budget_km,
+                aircraft_speed_kmh=aircraft_speed_kmh,
+                t_sat_h=t_sat_h,
+                min_spacing_km=min_spacing_km,
+                max_candidates_to_try=20,  # subset for speed during scoring
+            )
+        rt = embedded_route
+        # HARD REJECT: if sat can't be embedded in this state, the state
+        # fails objective 2 (the most heavily weighted) AND fails the spec's
+        # sat 6-min hard constraint.  ALNS must NOT pick such a state.
+        if rt is None or rt.cost.total_km > budget_km + 1e-6:
+            score = float("-inf")
+        else:
+            # Spec objectives (formulated objectives&constraints-multi):
+            # 1) max chord_length_sum (n_chords locked by case identity)
+            # 2) max coinc_dist (sat overpass)
+            # 3) max dropsonde flight km (passive metric)
+            # Budget = hard constraint, NOT objective.
+            score = (
+                w_chord_len * rt.cost.chord_length_sum_km
+                + w_coinc * rt.cost.coinc_dist_km
+                + w_dropsonde * rt.cost.dropsonde_dist_km
+            )
+        score_cache[sig] = score
+        return score
 
     alns_result = refine_plan_alns(
         state,
@@ -392,6 +531,9 @@ def refine_phase_a_plan(
         rng=random.Random(rng_seed),
         incumbent_callback=incumbent_callback,
         feasibility_check=_is_budget_feasible,
+        parallel_only=parallel_only,
+        freeze_chord_count=freeze_chord_count,
+        score_fn=_spec_objective_score if freeze_chord_count else None,
     )
 
     refined_route = materialise_route(
@@ -447,6 +589,32 @@ def refine_phase_a_plan(
             refined_route = refined_with_sat
             refined_cost = refined_with_sat.cost.total_km
 
+    # Hard reject: if sat candidates were supplied but no candidate ≥ 6 min
+    # could be embedded in the refined route under the precise insertion
+    # cost model, the plan is infeasible (Master + Luc 2026-06-10: 6 min is a
+    # HARD lower bound, not "skip sat").  Phase A's conservative side-trip
+    # estimate over-stated the headroom; precise insertion catches it.
+    infeasible_real_sat = False
+    reason = ""
+    if sat_candidates and sat_track_xy is not None and refined_sat_cand is None:
+        infeasible_real_sat = True
+        reason = (
+            "no sat arc >= 6 min fits the refined route under precise "
+            "insertion cost; Phase A's conservative side-trip estimate "
+            "over-stated headroom for this case"
+        )
+
+    _elapsed = _time.time() - _t_start
+    if _elapsed > runtime_warn_sec:
+        print(
+            f"*** Phase B WARNING: refine_phase_a_plan took {_elapsed:.0f} s "
+            f"(> {runtime_warn_sec:.0f} s threshold). Plan signature: "
+            f"n_tpvs={len(plan.tpv_indices)}, total_chords={plan.total_chords}. "
+            f"Likely cause: large chord-count makes per-iter materialise + sat "
+            f"embed quadratic. Cap max_iterations or shorten time_budget_sec.",
+            file=_sys.stderr,
+        )
+
     return PhaseBRefinement(
         refined_state=alns_result.incumbent,
         refined_route=refined_route,
@@ -462,4 +630,6 @@ def refine_phase_a_plan(
         refined_sat_position=refined_sat_pos,
         baseline_sat_candidate=baseline_sat_cand,
         baseline_sat_position=baseline_sat_pos,
+        infeasible_real_sat_insert=infeasible_real_sat,
+        infeasibility_reason=reason,
     )

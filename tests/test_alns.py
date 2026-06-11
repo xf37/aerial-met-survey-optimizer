@@ -249,3 +249,54 @@ def test_refine_plan_alns_with_zero_budget_returns_initial():
         rng=random.Random(0),
     )
     assert result.incumbent.total_chords() == initial.total_chords()
+
+
+# ---------------------------------------------------------------------------
+# freeze_chord_count regime (Master 2026-06-10)
+# ---------------------------------------------------------------------------
+
+def test_refine_plan_alns_freeze_chord_count_preserves_subset_and_counts():
+    """When freeze_chord_count=True, ALNS must not add/remove chords or
+    change which TPVs are visited.  Per-TPV chord count is locked."""
+    import random
+    from multi_target_planner.alns import refine_plan_alns
+    from multi_target_planner.chord_layout import fit_tpv_geometry
+    from multi_target_planner.chord_layout_b import NonParallelChordRecord
+    from multi_target_planner.alns import ALNSState
+    import numpy as np
+    from shapely.geometry import Polygon as _P
+    verts = np.array([[-200., -200.], [200., -200.], [200., 200.], [-200., 200.]])
+    poly = _P(verts)
+    geom = fit_tpv_geometry("T0", verts)
+    initial_state = ALNSState(
+        visit_order=[0],
+        chords_per_tpv={
+            0: [
+                NonParallelChordRecord(0, 0.0, 0.0,
+                                       p_entry=np.array([-150., 0.]),
+                                       p_exit=np.array([150., 0.]),
+                                       length_km=300.0, crosses_restricted=False),
+                NonParallelChordRecord(0, 0.0, 100.0,
+                                       p_entry=np.array([-150., 100.]),
+                                       p_exit=np.array([150., 100.]),
+                                       length_km=300.0, crosses_restricted=False),
+            ]
+        },
+    )
+    initial_n_chords = initial_state.total_chords()
+    result = refine_plan_alns(
+        initial_state,
+        tpv_index_by_position={0: 0},
+        tpv_polys={0: poly}, tpv_geoms={0: geom},
+        restricted_union=None,
+        min_spacing_km=80.0,
+        max_iterations=100, time_budget_sec=10.0,
+        rng=random.Random(7),
+        freeze_chord_count=True,
+    )
+    # Invariant preserved
+    assert result.incumbent.total_chords() == initial_n_chords
+    assert sorted(result.incumbent.visit_order) == sorted(initial_state.visit_order)
+    for pos in initial_state.visit_order:
+        assert len(result.incumbent.chords_per_tpv[pos]) == \
+            len(initial_state.chords_per_tpv[pos])

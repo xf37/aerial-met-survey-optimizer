@@ -80,6 +80,9 @@ class CostBreakdown:
     t_dep_h: float | None = None        # departure time = T_sat - d(BASE->sat_mid)/v
     sat_entry_km: tuple[float, float] | None = None
     sat_exit_km: tuple[float, float] | None = None
+    dropsonde_dist_km: float = 0.0      # passive metric: km flown inside the
+                                        # dropsonde-available region (spec §3)
+    chord_length_sum_km: float = 0.0    # objective 1 numerator: sum of TPV chord lengths
 
 
 @dataclass(frozen=True)
@@ -167,6 +170,7 @@ def build_route(
     atc_factor: float = DEFAULT_ATC_FACTOR,
     t_sat_h: float | None = None,
     aircraft_speed_kmh: float = DEFAULT_AIRCRAFT_SPEED_KMH,
+    dropsonde_union=None,
 ) -> BuiltRoute | None:
     """Build a route as ``BASE -> stops in order -> BASE``.
 
@@ -250,10 +254,18 @@ def build_route(
                     nxt_entry, nxt_exit = pt_a, pt_b
                 else:
                     nxt_entry, nxt_exit = pt_b, pt_a
-                # Inter-chord spacer (still inside the TPV; treated as straight).
-                waypoints.append(nxt_entry)
-                kinds.append("spacer")
-                geo_dist_so_far += float(np.linalg.norm(nxt_entry - cur))
+                # Inter-chord spacer: route via vis-graph in case the straight
+                # line from cur to nxt_entry crosses restricted airspace.
+                # Master 2026-06-10 / case 15 bug: a perturbed chord layout
+                # left a spacer cutting through restricted by 56 km — direct
+                # spacers are unsafe.
+                spacer_poly = _transit_polyline(cur, nxt_entry, restricted_union)
+                if spacer_poly is None:
+                    return None
+                for k in range(1, spacer_poly.shape[0]):
+                    waypoints.append(spacer_poly[k])
+                    kinds.append("spacer")
+                    geo_dist_so_far += float(np.linalg.norm(spacer_poly[k] - spacer_poly[k - 1]))
                 waypoints.append(nxt_exit)
                 kinds.append("chord")
                 geo_dist_so_far += float(np.linalg.norm(nxt_exit - nxt_entry))
@@ -269,6 +281,16 @@ def build_route(
             if track.shape[0] < 2 or np.linalg.norm(track[0] - sat.pt_a) > 1e-6:
                 # Defensive fallback: straight pt_a -> pt_b.
                 track = np.vstack([sat.pt_a, sat.pt_b])
+            # If any track segment crosses restricted airspace, this sat
+            # candidate is infeasible — we can't reroute satellite ground
+            # tracks around obstacles.  Reject the whole route build.
+            if restricted_union is not None and not restricted_union.is_empty:
+                for k in range(track.shape[0] - 1):
+                    seg = LineString([track[k], track[k + 1]])
+                    if seg.intersects(restricted_union):
+                        inside = seg.intersection(restricted_union)
+                        if hasattr(inside, "length") and inside.length > 1.0:
+                            return None
             # Distance up to sat midpoint for T_dep:
             arc_so_far = 0.0
             for k in range(1, track.shape[0]):
@@ -296,6 +318,7 @@ def build_route(
         return None
 
     polyline = np.vstack(waypoints)
+    kinds_tuple = tuple(kinds)
     cost = compute_route_cost(
         polyline=polyline,
         atc_union=atc_union,
@@ -309,6 +332,19 @@ def build_route(
     t_dep_h = None
     if t_sat_h is not None and geo_to_sat_mid is not None:
         t_dep_h = float(t_sat_h) - float(geo_to_sat_mid) / float(aircraft_speed_kmh)
+    # Objective 1: sum the lengths of every "chord" segment (TPV survey legs).
+    chord_length_sum_km = 0.0
+    for k, kind in enumerate(kinds_tuple):
+        if kind == "chord":
+            chord_length_sum_km += float(np.linalg.norm(polyline[k + 1] - polyline[k]))
+    # Objective 3: total km flown inside the dropsonde-available polygon.
+    dropsonde_dist_km = 0.0
+    if dropsonde_union is not None and not dropsonde_union.is_empty:
+        for k in range(polyline.shape[0] - 1):
+            seg = LineString([polyline[k], polyline[k + 1]])
+            inside = seg.intersection(dropsonde_union)
+            if hasattr(inside, "length") and inside.length > 0:
+                dropsonde_dist_km += float(inside.length)
     cost = CostBreakdown(
         geometric_km=cost.geometric_km,
         atc_extra_km=cost.atc_extra_km,
@@ -320,8 +356,10 @@ def build_route(
         t_dep_h=t_dep_h,
         sat_entry_km=sat_entry_xy,
         sat_exit_km=sat_exit_xy,
+        dropsonde_dist_km=float(dropsonde_dist_km),
+        chord_length_sum_km=float(chord_length_sum_km),
     )
-    return BuiltRoute(polyline=polyline, seg_kinds=tuple(kinds), cost=cost)
+    return BuiltRoute(polyline=polyline, seg_kinds=kinds_tuple, cost=cost)
 
 
 # ---------------------------------------------------------------------------

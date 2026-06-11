@@ -148,6 +148,97 @@ def destroy_remove_chord(state: ALNSState, rng: random.Random) -> ALNSState:
     return new_state
 
 
+def destroy_perturb_chord_offset(
+    state: ALNSState,
+    rng: random.Random,
+    *,
+    tpv_index_by_position: dict[int, int],
+    tpv_polys: dict[int, object],
+    tpv_geoms: dict[int, TpvGeometry],
+    restricted_union,
+    min_spacing_km: float,
+    s_step_km: float = DEFAULT_S_STEP_KM,
+) -> ALNSState:
+    """Pick one existing chord and shift it to a different s_km offset along
+    its major axis (theta stays the same).  Per-TPV chord COUNT is preserved
+    — this is the only ALNS move allowed in the ``freeze_chord_count``
+    regime (Master 2026-06-10: 'case identity = TPV subset + per-TPV chord
+    count').
+    """
+    candidates = [(pos, i) for pos, lst in state.chords_per_tpv.items()
+                  for i in range(len(lst))]
+    if not candidates:
+        return state
+    pos, i = rng.choice(candidates)
+    chord = state.chords_per_tpv[pos][i]
+    # Derive tpv_index from CURRENT visit_order, not the stale call-time
+    # mapping — destroy_swap_visit_order may have shuffled positions.
+    tpv_index = state.visit_order[pos]
+    poly = tpv_polys[tpv_index]
+    geom = tpv_geoms[tpv_index]
+    s_max = 0.95 * geom.a_km
+    n = int(s_max / s_step_km)
+    offsets = [round(-n * s_step_km + k * s_step_km, 6) for k in range(2 * n + 1)]
+    rng.shuffle(offsets)
+    other_chords = state.chords_per_tpv[pos][:i] + state.chords_per_tpv[pos][i + 1:]
+    for s in offsets:
+        if abs(s - chord.s_km) < 1e-6:
+            continue
+        rec = build_chord_at(
+            tpv_index, poly, geom,
+            theta_deg=chord.theta_deg, s_km=s,
+            restricted_union=restricted_union,
+        )
+        if rec is None or rec.crosses_restricted:
+            continue
+        candidate_list = other_chords + [rec]
+        ok, _ = chord_set_pairwise_feasible(candidate_list,
+                                            min_spacing_km=min_spacing_km)
+        if not ok:
+            continue
+        new_state = state.clone()
+        new_state.chords_per_tpv[pos] = candidate_list
+        return new_state
+    return state
+
+
+def destroy_swap_visit_order(state: ALNSState, rng: random.Random) -> ALNSState:
+    """Swap two positions in the TPV visit_order.  Chord assignments follow
+    (we swap which TPV index sits at which position; the chord list for each
+    position stays mapped by ``position`` key, but since position 0's chord
+    list now corresponds to a different tpv_index, we have to *swap the
+    chord lists* too so chord/TPV identity stays consistent).
+
+    Per-TPV chord COUNT is preserved by construction.
+    """
+    n = len(state.visit_order)
+    if n < 2:
+        return state
+    i, j = rng.sample(range(n), 2)
+    new_state = state.clone()
+    new_state.visit_order[i], new_state.visit_order[j] = (
+        new_state.visit_order[j], new_state.visit_order[i]
+    )
+    new_state.chords_per_tpv[i], new_state.chords_per_tpv[j] = (
+        new_state.chords_per_tpv[j], new_state.chords_per_tpv[i]
+    )
+    return new_state
+
+
+def _identity_signature(state: ALNSState) -> tuple:
+    """The locked invariants per Master 2026-06-10: TPV subset + per-TPV
+    chord count.  Keyed by tpv_index, NOT by position — swap_visit_order
+    moves the same TPV (with its chord list) to a different position and
+    must not be flagged as a violation."""
+    tpv_counts: dict[int, int] = {}
+    for pos, tpv_idx in enumerate(state.visit_order):
+        tpv_counts[tpv_idx] = len(state.chords_per_tpv.get(pos, []))
+    return (
+        tuple(sorted(state.visit_order)),
+        tuple(sorted(tpv_counts.items())),
+    )
+
+
 def destroy_perturb_angle(state: ALNSState, rng: random.Random) -> ALNSState:
     """Pick one chord and rotate its theta by a random ± step within the cap."""
     candidates = [(pos, i) for pos, lst in state.chords_per_tpv.items()
@@ -303,6 +394,10 @@ def refine_plan_alns(
     incumbent_callback: Callable[[int, ALNSState], None] | None = None,
     feasibility_check: Callable[[ALNSState], bool] | None = None,
     candidate_cache: dict | None = None,
+    parallel_only: bool = False,
+    freeze_chord_count: bool = False,
+    s_step_km: float = DEFAULT_S_STEP_KM,
+    score_fn: Callable[[ALNSState], float] | None = None,
 ) -> ALNSResult:
     """Run ALNS until ``time_budget_sec`` or ``max_iterations`` is exhausted.
 
@@ -312,8 +407,14 @@ def refine_plan_alns(
     rng = rng or random.Random(0)
     if candidate_cache is None:
         candidate_cache = {}
+
+    def _score(s: ALNSState) -> float:
+        if score_fn is not None:
+            return score_fn(s)
+        return state_score(s, theta_penalty_km_per_30deg=theta_penalty_km_per_30deg)
+
     incumbent = initial_state.clone()
-    incumbent_score = state_score(incumbent, theta_penalty_km_per_30deg=theta_penalty_km_per_30deg)
+    incumbent_score = _score(incumbent)
     history: list[tuple[int, float]] = [(0, incumbent_score)]
     current = incumbent.clone()
     current_score = incumbent_score
@@ -322,14 +423,36 @@ def refine_plan_alns(
     t0 = max(10.0, 0.05 * abs(current_score) / 1e6)
     decay = 0.998
 
-    destroy_ops = [
-        ("remove_chord", destroy_remove_chord),
-        ("perturb_angle", destroy_perturb_angle),
-    ]
-    repair_ops = [
-        ("insert_parallel", repair_insert_chord_parallel),
-        ("insert_any", repair_insert_chord_any),
-    ]
+    # Operator selection per Master's locks:
+    # - parallel_only=True  -> theta must stay 0; no angle perturbation
+    # - freeze_chord_count=True -> TPV subset and per-TPV chord count locked
+    #   ("case identity" — 2026-06-10).  Only chord-position perturbation
+    #   is allowed inside each TPV; no add/remove/swap-between-TPVs.
+    if freeze_chord_count:
+        destroy_ops = [
+            ("perturb_offset", "PERTURB_OFFSET_MARKER"),  # special-cased below
+            ("swap_visit_order", destroy_swap_visit_order),
+        ]
+        repair_ops = [
+            ("noop", lambda s, **_: s),  # identity — destroy already produces valid state
+        ]
+    elif parallel_only:
+        destroy_ops = [
+            ("remove_chord", destroy_remove_chord),
+        ]
+        repair_ops = [
+            ("insert_parallel", repair_insert_chord_parallel),
+        ]
+    else:
+        destroy_ops = [
+            ("remove_chord", destroy_remove_chord),
+            ("perturb_angle", destroy_perturb_angle),
+        ]
+        repair_ops = [
+            ("insert_parallel", repair_insert_chord_parallel),
+            ("insert_any", repair_insert_chord_any),
+        ]
+    initial_signature = _identity_signature(initial_state)
     d_weights = [1.0] * len(destroy_ops)
     r_weights = [1.0] * len(repair_ops)
 
@@ -349,9 +472,25 @@ def refine_plan_alns(
         r_name, r_fn = repair_ops[r_idx]
 
         # Destroy
-        candidate = d_fn(current, rng)
+        if freeze_chord_count:
+            if d_name == "perturb_offset":
+                candidate = destroy_perturb_chord_offset(
+                    current, rng,
+                    tpv_index_by_position=tpv_index_by_position,
+                    tpv_polys=tpv_polys, tpv_geoms=tpv_geoms,
+                    restricted_union=restricted_union,
+                    min_spacing_km=min_spacing_km,
+                    s_step_km=s_step_km,
+                )
+            else:
+                candidate = d_fn(current, rng)
+        else:
+            candidate = d_fn(current, rng)
+
         # Repair (only the two with full arg-set need keyword args).
-        if r_name == "insert_parallel":
+        if freeze_chord_count:
+            pass  # destroy already returns a valid candidate; no repair needed
+        elif r_name == "insert_parallel":
             candidate = repair_insert_chord_parallel(
                 candidate,
                 tpv_index_by_position=tpv_index_by_position,
@@ -369,7 +508,18 @@ def refine_plan_alns(
                 candidate_cache=candidate_cache,
             )
 
-        candidate_score = state_score(candidate, theta_penalty_km_per_30deg=theta_penalty_km_per_30deg)
+        # Invariant: case identity (TPV subset + per-TPV chord count) must NEVER
+        # drift when freeze_chord_count is active.  Master 2026-06-10:
+        # "case 15 means (TPV subset + chord counts) — anything else is a
+        # different case."  Loud, do-not-silently-drift assertion.
+        if freeze_chord_count and _identity_signature(candidate) != initial_signature:
+            raise AssertionError(
+                f"ALNS broke case-identity invariant at iter {k}: "
+                f"initial={initial_signature}, candidate={_identity_signature(candidate)} "
+                f"(d_op={d_name}, r_op={r_name})"
+            )
+
+        candidate_score = _score(candidate)
         accept = False
         if candidate_score > current_score:
             accept = True

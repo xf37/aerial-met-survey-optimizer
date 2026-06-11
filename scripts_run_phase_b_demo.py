@@ -8,6 +8,7 @@ renders a side-by-side before-vs-after PNG per plan.
 from __future__ import annotations
 
 import os
+import pickle
 import sys
 import time
 
@@ -35,6 +36,10 @@ from multi_target_planner.sat_arc import (
 
 T_SAT_H = 4.0  # satellite passes reference point at T = 4 h after departure
 
+# Master 2026-06-11 02:40: if Phase B runs longer than 30 min on ANY case,
+# emit a loud warning so the user knows something is off.
+PHASE_B_RUNTIME_WARN_SEC = 30 * 60
+
 
 # 777 / 12 h mission profile (matches notebook defaults).
 AIRCRAFT_SPEED_KMH = 905.0
@@ -45,14 +50,29 @@ TURN_PENALTY_KM = TURN_TIME_MIN / 60.0 * AIRCRAFT_SPEED_KMH
 SAT_MIN_LENGTH_KM = 6.0 / 60.0 * AIRCRAFT_SPEED_KMH
 SAT_ARC_MAX_KM = 30.0 / 60.0 * AIRCRAFT_SPEED_KMH
 
-# Master's requested plans (1-based indexing in the sorted-by-subset archive view).
-# Plan #1 added per PB-3: budget-loose single-TPV case shows Phase B value
-# (non-parallel chord around restricted + sat arc embedded).
-PLAN_INDICES = [1, 15, 18]
+# Master 2026-06-11 02:38: spec-aligned objectives (max chord_len_sum +
+# coinc + dropsonde, budget as constraint).  Re-run 15, 16, 17, 18.
+PLAN_INDICES = [15, 16, 17, 18]
 
-# Budget per refinement.
-TIME_BUDGET_SEC = 180.0
-MAX_ITERATIONS = 4000
+# Budget per refinement.  Each iter calls embed_best_sat_arc + materialise
+# so cost is ~5-15s/iter.  Cap iters hard so total stays under the 30-min
+# runtime alarm even on big cases (8 chords).
+TIME_BUDGET_SEC = 300.0   # 5 min hard cap per case (4 cases ≈ 20 min)
+MAX_ITERATIONS = 30
+
+
+def _objective_line(route) -> str:
+    """3-objective summary: chord len sum (obj 1), coinc (obj 2), dropsonde (obj 3)."""
+    if route is None:
+        return "obj1 chord_len=n/a   obj2 coinc=n/a   obj3 dropsonde=n/a"
+    chord_len = route.cost.chord_length_sum_km
+    coinc = route.cost.coinc_dist_km
+    drop = route.cost.dropsonde_dist_km
+    return (
+        f"obj1 chord_len_sum={chord_len:.0f} km   "
+        f"obj2 coinc={coinc:.0f} km   "
+        f"obj3 dropsonde={drop:.0f} km"
+    )
 
 
 def _sat_title_line(route) -> str:
@@ -180,14 +200,16 @@ def _render_before_after(out_path, plan, refinement, *, tpvs, base, gatepoints,
     ax.set_xlim(xmin, xmax); ax.set_ylim(ymin, ymax); ax.set_aspect("equal")
     ax.grid(True, alpha=0.25)
     base_sat = _sat_title_line(refinement.baseline_route)
+    base_obj = _objective_line(refinement.baseline_route)
     ax.set_title(
         f"Plan #{plan_idx}  BEFORE (Phase A baseline)\n"
         f"n_tpvs={plan.n_tpvs}  total_chords={plan.total_chords}  "
         f"max_chord={plan.max_chord_single_tpv}\n"
-        f"cost={refinement.baseline_cost_km:.0f}/{BUDGET_KM:.0f} km\n"
+        f"cost={refinement.baseline_cost_km:.0f}/{BUDGET_KM:.0f} km (CONSTRAINT)\n"
+        f"{base_obj}\n"
         f"{base_sat}\n"
         f"{initial_visit}",
-        fontsize=9,
+        fontsize=8,
     )
 
     # Refined
@@ -203,15 +225,16 @@ def _render_before_after(out_path, plan, refinement, *, tpvs, base, gatepoints,
     max_chord_ref = state.max_chord_single_tpv()
     n_tpvs_ref = sum(1 for v in state.chords_per_tpv.values() if v)
     ref_sat = _sat_title_line(refinement.refined_route)
+    ref_obj = _objective_line(refinement.refined_route)
     ax.set_title(
         f"Plan #{plan_idx}  AFTER (Phase B refined)\n"
         f"n_tpvs={n_tpvs_ref}  total_chords={n_chords_ref}  "
         f"max_chord={max_chord_ref}\n"
-        f"cost={refinement.refined_cost_km:.0f}/{BUDGET_KM:.0f} km   "
-        f"(delta chords {refinement.chord_delta:+d}, delta cost {refinement.cost_delta_km:+.0f} km)\n"
+        f"cost={refinement.refined_cost_km:.0f}/{BUDGET_KM:.0f} km (CONSTRAINT)\n"
+        f"{ref_obj}\n"
         f"{ref_sat}\n"
         f"{refined_visit}",
-        fontsize=9,
+        fontsize=8,
     )
 
     legend_handles = [
@@ -256,25 +279,36 @@ def main():
     base = base_km(frame)
     restricted_union = unary_union(restricted) if restricted else None
     atc_union = unary_union(atc) if atc else None
+    dropsonde_union = unary_union(dropsonde) if dropsonde else None
 
-    print("[Phase B demo] Running Phase A…")
-    t0 = time.time()
-    result = phase_a_envelope(
-        tpvs=tpvs,
-        base_km=base, gatepoints_km=gatepoints,
-        restricted_union=restricted_union, atc_union=atc_union,
-        sat_track_xy=satellite, enforce_sat_constraint=True,
-        n_chord_options=(1, 2, 3, 4),
-        angle_devs_deg=(-5.0, 0.0, 5.0),
-        min_spacing_km=100.0,
-        budget_km=BUDGET_KM, turn_penalty_km=TURN_PENALTY_KM,
-        aircraft_speed_kmh=AIRCRAFT_SPEED_KMH,
-        sat_min_length_km=SAT_MIN_LENGTH_KM,
-        sat_arc_max_km=SAT_ARC_MAX_KM,
-        k_per_bundle=999,
-    )
-    print(f"[Phase B demo] Phase A took {time.time() - t0:.0f} s; "
-          f"archive size = {result.archive_size}")
+    cache_path = "phase_a_archive.pkl"
+    if os.path.exists(cache_path):
+        print(f"[Phase B demo] Loading cached Phase A result from {cache_path}…")
+        with open(cache_path, "rb") as f:
+            result = pickle.load(f)
+        print(f"[Phase B demo] archive size = {result.archive_size}")
+    else:
+        print("[Phase B demo] Running Phase A (no cache)…")
+        t0 = time.time()
+        result = phase_a_envelope(
+            tpvs=tpvs,
+            base_km=base, gatepoints_km=gatepoints,
+            restricted_union=restricted_union, atc_union=atc_union,
+            sat_track_xy=satellite, enforce_sat_constraint=True,
+            n_chord_options=(1, 2, 3, 4),
+            angle_devs_deg=(-5.0, 0.0, 5.0),
+            min_spacing_km=100.0,
+            budget_km=BUDGET_KM, turn_penalty_km=TURN_PENALTY_KM,
+            aircraft_speed_kmh=AIRCRAFT_SPEED_KMH,
+            sat_min_length_km=SAT_MIN_LENGTH_KM,
+            sat_arc_max_km=SAT_ARC_MAX_KM,
+            k_per_bundle=999,
+        )
+        print(f"[Phase B demo] Phase A took {time.time() - t0:.0f} s; "
+              f"archive size = {result.archive_size}")
+        with open(cache_path, "wb") as f:
+            pickle.dump(result, f)
+        print(f"[Phase B demo] Cached Phase A result to {cache_path}")
 
     # Collect plans in the same ordering as the all-18 figure (subset size,
     # subset id, cost).
@@ -328,6 +362,9 @@ def main():
             sat_track_xy=satellite,
             t_sat_h=T_SAT_H,
             aircraft_speed_kmh=AIRCRAFT_SPEED_KMH,
+            parallel_only=True,  # Master 2026-06-10: lock to parallel chords
+            freeze_chord_count=True,  # Master 2026-06-10: case identity = subset + chord counts
+            dropsonde_union=dropsonde_union,  # Master 2026-06-11: objective 3
         )
         dt = time.time() - t0
         ref_coinc = (refinement.refined_route.cost.coinc_dist_km
@@ -339,6 +376,10 @@ def main():
               f"d_cost = {refinement.cost_delta_km:+.0f} km, "
               f"sat_coinc = {ref_coinc:.0f} km, "
               f"T_dep = {ref_tdep if ref_tdep is None else f'{ref_tdep:.2f}h'}")
+        if dt > PHASE_B_RUNTIME_WARN_SEC:
+            print(f"  *** WARNING: Phase B on plan #{plan_idx} took "
+                  f"{dt:.0f} s (> {PHASE_B_RUNTIME_WARN_SEC} s threshold). "
+                  f"Investigate ALNS / materialise cost. ***")
         out_path = f"11_phase_b_plan_{plan_idx:02d}_before_after.png"
         _render_before_after(
             out_path, plan, refinement,
