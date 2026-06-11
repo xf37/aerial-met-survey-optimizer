@@ -80,9 +80,14 @@ def slice_track_between(
     if s0 > s1:
         s0, s1 = s1, s0
     pts: list[np.ndarray] = [_interp_track(track_xy, cum, s0)]
+    # i0 = first track vertex strictly after s0; i1 = first track vertex with
+    # cum >= s1.  Loop appends [i0, i1) so the last track vertex included is
+    # STRICTLY BEFORE s1 — otherwise we tack on an extra vertex past pt_b,
+    # which Master flagged 2026-06-11 as "the purple sat line sticks out
+    # beyond the OUT square".
     i0 = int(np.searchsorted(cum, s0, side="right"))
     i1 = int(np.searchsorted(cum, s1, side="left"))
-    for k in range(i0, i1 + 1):
+    for k in range(i0, i1):
         if k < len(track_xy):
             pts.append(track_xy[k])
     pts.append(_interp_track(track_xy, cum, s1))
