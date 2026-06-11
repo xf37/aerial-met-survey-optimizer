@@ -96,6 +96,20 @@ from multi_target_planner.chord_layout_b import (
     survey_distance,
     theta_grid_deg,
 )
+from multi_target_planner.alns import (
+    ALNSResult,
+    ALNSState,
+    DEFAULT_THETA_PENALTY_KM,
+    refine_plan_alns,
+    state_cost,
+    state_score,
+)
+from multi_target_planner.phase_b_driver import (
+    PhaseBRefinement,
+    materialise_route,
+    phase_a_plan_to_alns_state,
+    refine_phase_a_plan,
+)
 
 __all__ = [
     # turn penalty
@@ -176,4 +190,16 @@ __all__ = [
     "s_grid_km",
     "survey_distance",
     "theta_grid_deg",
+    # PB-2 ALNS
+    "ALNSResult",
+    "ALNSState",
+    "DEFAULT_THETA_PENALTY_KM",
+    "refine_plan_alns",
+    "state_cost",
+    "state_score",
+    # PB-4 driver
+    "PhaseBRefinement",
+    "materialise_route",
+    "phase_a_plan_to_alns_state",
+    "refine_phase_a_plan",
 ]
